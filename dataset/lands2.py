@@ -85,6 +85,7 @@ class PSLandslideSentinel2Dataset(Dataset):
                     if d.is_dir()
                     and (d / "s2_10m.tif").exists()
                     and (d / "s2_20m.tif").exists()
+                    and (d / "s2_valid.tif").exists()
                 ])
 
                 if not all_dates:
@@ -116,9 +117,10 @@ class PSLandslideSentinel2Dataset(Dataset):
 
     # ── Lettura ───────────────────────────────────────────────────────────
     def _read(self, path: Path) -> torch.Tensor:
-        """Legge un GeoTIFF e lo converte in tensor float32."""
+        """Read a GeoTIFF while converting only its explicit NoData to zero."""
         with rasterio.open(path) as src:
-            return torch.from_numpy(src.read().astype(np.float32))
+            data = src.read(masked=True).astype(np.float32)
+        return torch.from_numpy(np.ma.filled(data, fill_value=0.0))
 
     def _load_frame(self, s2_dir: Path, date: str) -> torch.Tensor:
         """Carica e concatena le bande 10m (4) e 20m (6) per una data → (10, H, W)."""

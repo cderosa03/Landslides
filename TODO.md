@@ -59,12 +59,12 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 6. NoData e nuvole Sentinel
 
-- [ ] Gestire esplicitamente `src_nodata`, `dst_nodata` e inizializzazione della destinazione.
-- [ ] Non confondere zero radiometrico, padding temporale e assenza di dati.
-- [ ] Riproiettare e utilizzare Sen2Cor/SCL.
-- [ ] Produrre una maschera spaziale dei pixel Sentinel validi.
-- [ ] Definire una soglia massima di nuvole o pixel invalidi.
-- [ ] Evitare che il resampling bilineare mescoli NoData e pixel validi.
+- [x] Gestire esplicitamente `src_nodata`, `dst_nodata` e inizializzazione della destinazione.
+- [x] Non confondere zero radiometrico, padding temporale e assenza di dati.
+- [x] Riproiettare e utilizzare Sen2Cor/SCL.
+- [x] Produrre una maschera spaziale dei pixel Sentinel validi.
+- [x] Definire una soglia massima di nuvole o pixel invalidi.
+- [x] Evitare che il resampling bilineare mescoli NoData e pixel validi.
 
 ## 7. Selezione temporale
 

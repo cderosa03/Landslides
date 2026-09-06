@@ -20,12 +20,20 @@ PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "PlanetScope" / "patc
 S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
 S2_PRODUCT_LEVEL = "MSIL2A"
 MIN_VALID_COVERAGE = float(os.getenv("S2_MIN_VALID_COVERAGE", "0.95"))
+MAX_INVALID_FRACTION = float(os.getenv("S2_MAX_INVALID_FRACTION", "0.20"))
+INVALID_SCL_CLASSES = frozenset(
+    int(value)
+    for value in os.getenv("S2_INVALID_SCL_CLASSES", "0,1,3,8,9,10").split(",")
+)
+NODATA_VALUE = -9999.0
 EVENTS = os.getenv(
     "S2_EVENTS", "Lombok2018,Philippines2019,Michoacan2022,EmiliaRomagna2023"
 ).split(",")
 
 if not 0.0 <= MIN_VALID_COVERAGE <= 1.0:
     raise ValueError("S2_MIN_VALID_COVERAGE must be between 0 and 1")
+if not 0.0 <= MAX_INVALID_FRACTION <= 1.0:
+    raise ValueError("S2_MAX_INVALID_FRACTION must be between 0 and 1")
 
 
 def get_crs_from_mgrs(tile_name: str):
@@ -116,9 +124,12 @@ def get_all_s2_images_for_tile(tile_dir: Path) -> dict:
         date_str = date_dir.name
         s2_10m = date_dir / f"{date_str}_10m.tif"
         s2_20m = date_dir / f"{date_str}_20m.tif"
+        scl = date_dir / "sen2cor.tif"
 
-        if s2_10m.exists() and s2_20m.exists():
-            s2_images[date_str] = {"10m": s2_10m, "20m": s2_20m}
+        if s2_10m.exists() and s2_20m.exists() and scl.exists():
+            s2_images[date_str] = {"10m": s2_10m, "20m": s2_20m, "scl": scl}
+        elif s2_10m.exists() and s2_20m.exists():
+            logging.warning("Skipping %s: missing Sen2Cor SCL mask", date_dir)
 
     return s2_images
 
@@ -142,7 +153,7 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader):
                 raise ValueError("Patch dataset has no CRS defined")
 
             dst_shape = (src.count, patch_ds.height, patch_ds.width)
-            dst = np.zeros(dst_shape, dtype=np.float32)
+            dst = np.full(dst_shape, NODATA_VALUE, dtype=np.float32)
             valid = np.zeros((patch_ds.height, patch_ds.width), dtype=np.uint8)
 
             reproject(
@@ -152,6 +163,9 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader):
                 src_crs=src_crs,
                 dst_transform=patch_ds.transform,
                 dst_crs=patch_ds.crs,
+                src_nodata=src.nodata,
+                dst_nodata=NODATA_VALUE,
+                init_dest_nodata=True,
                 resampling=Resampling.bilinear,
                 num_threads=2,
                 warp_mem_limit=512,
@@ -175,9 +189,50 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader):
         return None, None
 
 
+def reproject_scl_to_patch(scl_path: Path, patch_ds: rasterio.io.DatasetReader):
+    """Project the L2A Scene Classification Layer without interpolating classes."""
+    try:
+        with rasterio.open(scl_path) as src:
+            src_crs = src.crs or get_crs_from_mgrs(scl_path.parents[2].name)
+            if src_crs is None or patch_ds.crs is None:
+                raise ValueError("SCL or Planet patch CRS is unavailable")
+
+            scl = np.zeros((patch_ds.height, patch_ds.width), dtype=np.uint8)
+            coverage = np.zeros_like(scl)
+            reproject(
+                source=src.read(1),
+                destination=scl,
+                src_transform=src.transform,
+                src_crs=src_crs,
+                src_nodata=src.nodata,
+                dst_transform=patch_ds.transform,
+                dst_crs=patch_ds.crs,
+                dst_nodata=0,
+                init_dest_nodata=True,
+                resampling=Resampling.nearest,
+                num_threads=2,
+                warp_mem_limit=512,
+            )
+            reproject(
+                source=src.dataset_mask(),
+                destination=coverage,
+                src_transform=src.transform,
+                src_crs=src_crs,
+                dst_transform=patch_ds.transform,
+                dst_crs=patch_ds.crs,
+                resampling=Resampling.nearest,
+                num_threads=2,
+                warp_mem_limit=512,
+            )
+        return scl, coverage.astype(bool)
+    except Exception as error:
+        logging.warning("Skipping SCL %s: %s", scl_path, error)
+        return None, None
+
+
 def mosaic_s2_images(image_paths, patch_ds):
     """Merge same-date tiles by taking the first valid pixel in sorted tile order."""
-    mosaic_10m = mosaic_20m = valid_10m = valid_20m = None
+    mosaic_10m = mosaic_20m = valid = None
 
     for image_paths_for_tile in image_paths:
         data_10m, coverage_10m = reproject_s2_to_patch(
@@ -186,28 +241,31 @@ def mosaic_s2_images(image_paths, patch_ds):
         data_20m, coverage_20m = reproject_s2_to_patch(
             image_paths_for_tile["20m"], patch_ds
         )
-        if data_10m is None or data_20m is None:
+        scl, scl_coverage = reproject_scl_to_patch(image_paths_for_tile["scl"], patch_ds)
+        if data_10m is None or data_20m is None or scl is None:
             continue
 
         if mosaic_10m is None:
             mosaic_10m = np.zeros_like(data_10m)
             mosaic_20m = np.zeros_like(data_20m)
-            valid_10m = np.zeros_like(coverage_10m, dtype=bool)
-            valid_20m = np.zeros_like(coverage_20m, dtype=bool)
+            valid = np.zeros_like(coverage_10m, dtype=bool)
 
-        take_10m = coverage_10m & ~valid_10m
-        take_20m = coverage_20m & ~valid_20m
-        mosaic_10m[:, take_10m] = data_10m[:, take_10m]
-        mosaic_20m[:, take_20m] = data_20m[:, take_20m]
-        valid_10m |= coverage_10m
-        valid_20m |= coverage_20m
+        tile_valid = (
+            coverage_10m
+            & coverage_20m
+            & scl_coverage
+            & ~np.isin(scl, tuple(INVALID_SCL_CLASSES))
+        )
+        take = tile_valid & ~valid
+        mosaic_10m[:, take] = data_10m[:, take]
+        mosaic_20m[:, take] = data_20m[:, take]
+        valid |= tile_valid
 
     if mosaic_10m is None:
         return None, None, None
 
-    valid = valid_10m & valid_20m
-    mosaic_10m[:, ~valid] = 0.0
-    mosaic_20m[:, ~valid] = 0.0
+    mosaic_10m[:, ~valid] = NODATA_VALUE
+    mosaic_20m[:, ~valid] = NODATA_VALUE
     return mosaic_10m, mosaic_20m, valid
 
 
@@ -243,6 +301,7 @@ def write_patch(
         "dtype": data.dtype,
         "transform": ref_ds.transform,
         "crs": ref_ds.crs,
+        "nodata": NODATA_VALUE,
     })
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(out_path, "w", **meta) as dst:
@@ -264,6 +323,7 @@ def write_coverage(
         "dtype": "uint8",
         "transform": ref_ds.transform,
         "crs": ref_ds.crs,
+        "nodata": 0,
     })
     with rasterio.open(out_path, "w", **meta) as dst:
         dst.write(valid.astype(np.uint8), 1)
@@ -301,14 +361,18 @@ def process_patch(patch_dir: Path, event: str):
                 continue
 
             coverage = float(valid.mean())
-            if coverage < MIN_VALID_COVERAGE:
+            invalid_fraction = 1.0 - coverage
+            if (
+                coverage < MIN_VALID_COVERAGE
+                or invalid_fraction > MAX_INVALID_FRACTION
+            ):
                 logging.warning(
-                    "Skipping %s/%s on %s: valid coverage %.2f%% < %.2f%%",
+                    "Skipping %s/%s on %s: valid %.2f%%, invalid %.2f%%",
                     event,
                     patch_dir.name,
                     date_str,
                     coverage * 100,
-                    MIN_VALID_COVERAGE * 100,
+                    invalid_fraction * 100,
                 )
                 continue
 
@@ -317,10 +381,12 @@ def process_patch(patch_dir: Path, event: str):
             metadata = {
                 **mosaic_metadata(date_str, image_paths),
                 "s2_valid_coverage": f"{coverage:.6f}",
+                "s2_invalid_fraction": f"{invalid_fraction:.6f}",
+                "s2_invalid_scl_classes": ",".join(map(str, sorted(INVALID_SCL_CLASSES))),
             }
             write_patch(date_dir / "s2_10m.tif", s2_10m_patch, patch_ds, metadata)
             write_patch(date_dir / "s2_20m.tif", s2_20m_patch, patch_ds, metadata)
-            write_coverage(date_dir / "s2_coverage.tif", valid, patch_ds, metadata)
+            write_coverage(date_dir / "s2_valid.tif", valid, patch_ds, metadata)
             s2_count += 1
             logging.info(
                 "Saved Sentinel-2 mosaic for %s from tiles %s (coverage %.2f%%)",
