@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import requests
 import zipfile
@@ -14,9 +15,12 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-DOWNLOAD_DIR = Path("/home/jovyan/nfs/tesista3/landslide-detection/Landslides/Sentinel/images")
-# CREARE ACCOUNT
-CREDENTIALS_PATH = Path("/home/jovyan/nfs/tesista3/landslide-detection/s2_builder/credentials.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DOWNLOAD_DIR = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
+CREDENTIALS_PATH = Path(
+    os.getenv("S2_CREDENTIALS_PATH", Path(__file__).with_name("credentials.json"))
+)
+PRODUCT_LEVEL = "MSIL2A"
 
 ACCESS_TOKEN = None
 REFRESH_TOKEN = None
@@ -31,8 +35,6 @@ def load_credentials():
         logging.critical(f"Failed to load login credentials from {CREDENTIALS_PATH}: {e}")
         raise
 
-
-credentials = load_credentials()
 
 INVENTORIES = [
     {
@@ -70,9 +72,6 @@ INVENTORIES = [
         "end_date": "2023-07-01T00:00:00.000Z",
     },
 ]
-
-PRODUCT_LEVELS = ["MSIL1C", "MSIL2A"]
-
 
 def get_access_token(username: str, password: str):
     """Request a new access_token and refresh_token."""
@@ -117,7 +116,7 @@ def regenerate_access_token(refresh_token: str):
         return None
 
 
-def handle_token_expiry():
+def handle_token_expiry(credentials):
     """Handle token expiry by refreshing or requesting a new access token."""
     global ACCESS_TOKEN, REFRESH_TOKEN
     ACCESS_TOKEN = regenerate_access_token(REFRESH_TOKEN)
@@ -175,7 +174,7 @@ def fetch_products(params):
     return product_list
 
 
-def download_product(product, inventory_name, product_level):
+def download_product(product, inventory_name, product_level, credentials):
     """Download and unzip a specific product."""
     global ACCESS_TOKEN
     product_id = product["Id"]
@@ -206,7 +205,7 @@ def download_product(product, inventory_name, product_level):
             response.raise_for_status()
         except requests.RequestException as e:
             logging.warning(f"Download failed for {product_name}: {e}")
-            handle_token_expiry()
+            handle_token_expiry(credentials)
             attempt += 1
             if attempt >= 3:
                 logging.error(f"Too many failed attempts for {product_name}.")
@@ -249,44 +248,50 @@ def unzip_product(zip_path: Path):
         logging.error(f"Failed to extract {zip_path.name}: {e}")
 
 
-if __name__ == "__main__":
+def main():
+    credentials = None
     for inventory in INVENTORIES:
         inventory_name = inventory["name"]
         start_date = inventory["start_date"]
         end_date = inventory["end_date"]
         tiles = inventory["tiles"]
 
-        for product_level in PRODUCT_LEVELS:
-            logging.info(f"Starting downloads for product level: {product_level}")
+        product_level = PRODUCT_LEVEL
+        logging.info(f"Starting downloads for product level: {product_level}")
             
-            for tile in tiles:
-                tile_id = tile["id"]
-                tile_ron = tile["ron"]
-                logging.info(f"Processing tile: {tile_id}")
+        for tile in tiles:
+            tile_id = tile["id"]
+            tile_ron = tile["ron"]
+            logging.info(f"Processing tile: {tile_id}")
         
-                params = {
-                    "$filter": f"Collection/Name eq 'SENTINEL-2' and "
-                    f"contains(Name, '{tile_id}') and "
-                    f"contains(Name, '{tile_ron}') and "
-                    f"contains(Name, '{product_level}') and "
-                    f"ContentDate/Start gt {start_date} and "
-                    f"ContentDate/Start lt {end_date}",
-                    "$orderby": "ContentDate/Start asc",
-                }
+            params = {
+                "$filter": f"Collection/Name eq 'SENTINEL-2' and "
+                f"contains(Name, '{tile_id}') and "
+                f"contains(Name, '{tile_ron}') and "
+                f"contains(Name, '{product_level}') and "
+                f"ContentDate/Start gt {start_date} and "
+                f"ContentDate/Start lt {end_date}",
+                "$orderby": "ContentDate/Start asc",
+            }
 
-                try:
-                    products = fetch_products(params)
-                    logging.info(f"Found {len(products)} products for tile {tile_id}.")
+            try:
+                products = fetch_products(params)
+                logging.info(f"Found {len(products)} products for tile {tile_id}.")
 
-                    # Ensure tokens are loaded
-                    if not ACCESS_TOKEN:
-                        username, password = credentials["username"], credentials["password"]
-                        ACCESS_TOKEN, REFRESH_TOKEN = get_access_token(username, password)
+                # Ensure tokens are loaded only once an actual download is needed.
+                if products and not ACCESS_TOKEN:
+                    credentials = credentials or load_credentials()
+                    username, password = credentials["username"], credentials["password"]
+                    ACCESS_TOKEN, REFRESH_TOKEN = get_access_token(username, password)
 
-                    for i, product in enumerate(products):
-                        logging.info(f"Downloading product {i + 1}/{len(products)}")
-                        download_product(product, inventory_name, product_level)
-                except Exception as e:
-                    logging.error(f"Error processing tile {tile_id}: {e}")
+                for i, product in enumerate(products):
+                    logging.info(f"Downloading product {i + 1}/{len(products)}")
+                    download_product(product, inventory_name, product_level, credentials)
+            except Exception as e:
+                logging.error(f"Error processing tile {tile_id}: {e}")
 
     logging.info("All downloads completed.")
+
+
+if __name__ == "__main__":
+    main()

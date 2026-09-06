@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+import os
 from pathlib import Path
 from shapely.geometry import box
 import rasterio
@@ -13,9 +14,13 @@ logging.basicConfig(
 )
 
 
-PS_BASE = Path("/home/jovyan/nfs/tesista3/landslide-detection/Landslides/PlanetScope/patches/")
-S2_BASE = Path("/home/jovyan/nfs/tesista3/landslide-detection/Landslides/Sentinel/images/")
-EVENTS = ["Lombok2018", "Philippines2019", "Michoacan2022", "EmiliaRomagna2023"]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "PlanetScope" / "patches"))
+S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
+S2_PRODUCT_LEVEL = "MSIL2A"
+EVENTS = os.getenv(
+    "S2_EVENTS", "Lombok2018,Philippines2019,Michoacan2022,EmiliaRomagna2023"
+).split(",")
 
 
 def get_crs_from_mgrs(tile_name: str):
@@ -65,51 +70,50 @@ def find_overlapping_s2_tiles(event: str, patch_ds: rasterio.io.DatasetReader) -
 
         patch_box = get_patch_bounds_utm(patch_ds, tile_crs.to_epsg())
 
-        for level_dir in tile_dir.iterdir():  # MSIL1C / MSIL2A
-            if not level_dir.is_dir():
+        level_dir = tile_dir / S2_PRODUCT_LEVEL
+        if not level_dir.is_dir():
+            continue
+
+        for date_dir in level_dir.iterdir():
+            if not date_dir.is_dir():
                 continue
 
-            for date_dir in level_dir.iterdir():
-                if not date_dir.is_dir():
-                    continue
+            s2_file = date_dir / f"{date_dir.name}_10m.tif"
+            if not s2_file.exists():
+                continue
 
-                s2_file = date_dir / f"{date_dir.name}_10m.tif"
-                if not s2_file.exists():
-                    continue
-
-                try:
-                    with rasterio.open(s2_file) as ds:
-                        ds_crs = ds.crs or tile_crs
-                        s2_bounds = box(*transform_bounds(ds_crs, tile_crs, *ds.bounds))
-                        if patch_box.intersects(s2_bounds):
-                            overlapping_tiles.append(tile_dir)
-                            logging.info(f"Found overlapping Sentinel-2 tile {tile_dir.name}")
-                            break
-                except Exception as e:
-                    logging.warning(f"Error reading {s2_file}: {e}")
-                    continue
+            try:
+                with rasterio.open(s2_file) as ds:
+                    ds_crs = ds.crs or tile_crs
+                    s2_bounds = box(*transform_bounds(ds_crs, tile_crs, *ds.bounds))
+                    if patch_box.intersects(s2_bounds):
+                        overlapping_tiles.append(tile_dir)
+                        logging.info(f"Found overlapping Sentinel-2 tile {tile_dir.name}")
+                        break
+            except Exception as e:
+                logging.warning(f"Error reading {s2_file}: {e}")
+                continue
 
     return overlapping_tiles
 
 
 def get_all_s2_images_for_tile(tile_dir: Path) -> dict:
-    """Search Sentinel-2 10m and 20m images in all levels (MSIL1C, MSIL2A)."""
+    """Search paired Sentinel-2 L2A 10m and 20m images for one tile."""
     s2_images = {}
+    level_dir = tile_dir / S2_PRODUCT_LEVEL
+    if not level_dir.is_dir():
+        return s2_images
 
-    for level_dir in tile_dir.iterdir():
-        if not level_dir.is_dir():
+    for date_dir in sorted(level_dir.iterdir()):
+        if not date_dir.is_dir():
             continue
 
-        for date_dir in sorted(level_dir.iterdir()):
-            if not date_dir.is_dir():
-                continue
+        date_str = date_dir.name
+        s2_10m = date_dir / f"{date_str}_10m.tif"
+        s2_20m = date_dir / f"{date_str}_20m.tif"
 
-            date_str = date_dir.name
-            s2_10m = date_dir / f"{date_str}_10m.tif"
-            s2_20m = date_dir / f"{date_str}_20m.tif"
-
-            if s2_10m.exists() and s2_20m.exists():
-                s2_images[date_str] = {"10m": s2_10m, "20m": s2_20m}
+        if s2_10m.exists() and s2_20m.exists():
+            s2_images[date_str] = {"10m": s2_10m, "20m": s2_20m}
 
     return s2_images
 
@@ -154,7 +158,20 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader) ->
         return None
 
 
-def write_patch(out_path: Path, data: np.ndarray, ref_ds: rasterio.io.DatasetReader):
+def source_tags(s2_path: Path) -> dict:
+    with rasterio.open(s2_path) as source:
+        tags = {key: value for key, value in source.tags().items() if key.startswith("s2_")}
+    tags.setdefault("s2_level", S2_PRODUCT_LEVEL)
+    tags["s2_source_file"] = str(s2_path)
+    return tags
+
+
+def write_patch(
+    out_path: Path,
+    data: np.ndarray,
+    ref_ds: rasterio.io.DatasetReader,
+    metadata: dict,
+):
     """Write a new GeoTIFF patch with metadata matching PlanetScope."""
     meta = ref_ds.meta.copy()
     meta.update({
@@ -168,6 +185,7 @@ def write_patch(out_path: Path, data: np.ndarray, ref_ds: rasterio.io.DatasetRea
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(out_path, "w", **meta) as dst:
         dst.write(data)
+        dst.update_tags(**metadata)
 
 
 def process_patch(patch_dir: Path, event: str):
@@ -194,8 +212,18 @@ def process_patch(patch_dir: Path, event: str):
                     continue
 
                 date_dir = patch_dir / "s2" / date_str
-                write_patch(date_dir / "s2_10m.tif", s2_10m_patch, patch_ds)
-                write_patch(date_dir / "s2_20m.tif", s2_20m_patch, patch_ds)
+                write_patch(
+                    date_dir / "s2_10m.tif",
+                    s2_10m_patch,
+                    patch_ds,
+                    source_tags(paths["10m"]),
+                )
+                write_patch(
+                    date_dir / "s2_20m.tif",
+                    s2_20m_patch,
+                    patch_ds,
+                    source_tags(paths["20m"]),
+                )
                 s2_count += 1
                 logging.info(f"Saved Sentinel-2 patch for {date_str} ({tile_dir.name})")
 
