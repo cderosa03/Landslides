@@ -19,12 +19,11 @@ SLOPE_FILENAME = "slope_wide.tif"
 ASPECT_FILENAME = "aspect_wide.tif"
 MASK_FILENAME = "mask.tif"
 
-# AUX contract used by the current pipeline.  Normalization is intentionally
-# explicit: these values are still in their source units until the dedicated
-# AUX-fusion step is implemented.
-AUX_CHANNELS = ("dem", "slope", "aspect")
-AUX_UNITS = ("metres", "degrees", "degrees")
-AUX_NORMALIZATION = "raw_source_units"
+# AUX use their native-grid wide context: the same array dimensions as Planet,
+# but a larger geographic footprint centred on the Planet patch.
+AUX_CHANNELS = ("dem_asinh", "slope_unit", "aspect_sin", "aspect_cos")
+AUX_UNITS = ("normalized", "normalized", "unitless", "unitless")
+AUX_NORMALIZATION = "asinh(dem_metres / 1000), slope_degrees / 90, sin/cos(aspect)"
 
 
 class PSLandslideDataset(Dataset):
@@ -164,10 +163,22 @@ class PSLandslideDataset(Dataset):
         aspect = aspect.to(torch.float32)
         mask = (mask > 0).to(torch.uint8)
 
-        # AUX channel order: DEM [m], slope [degrees], aspect [degrees].
-        # Values remain in raw source units for now; normalization belongs to
-        # the later AUX-fusion step and must be dataset-statistics based.
-        aux = torch.cat([dtm, slope, aspect], dim=0)
+        # Keep terrain information stable without relying on split-specific
+        # statistics: DEM retains absolute scale, slope is bounded, and aspect
+        # is circular so 0Â° and 360Â° remain adjacent.
+        dtm = torch.nan_to_num(dtm, nan=0.0, posinf=0.0, neginf=0.0)
+        slope = torch.nan_to_num(slope, nan=0.0, posinf=90.0, neginf=0.0)
+        aspect = torch.nan_to_num(aspect, nan=0.0, posinf=0.0, neginf=0.0)
+        aspect_radians = torch.deg2rad(torch.remainder(aspect, 360.0))
+        aux = torch.cat(
+            [
+                torch.asinh(dtm / 1000.0),
+                torch.clamp(slope, 0.0, 90.0) / 90.0,
+                torch.sin(aspect_radians),
+                torch.cos(aspect_radians),
+            ],
+            dim=0,
+        )
 
         if self.apply_transform:
             pre, post, aux, mask = self.transform(pre, post, aux, mask)

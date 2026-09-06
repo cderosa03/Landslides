@@ -77,27 +77,27 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 8. Diagnostica geospaziale riproducibile
 
-- [ ] Creare uno script che controlli CRS, transform, bounds, risoluzione e dimensioni.
-- [ ] Verificare ordine degli assi e coordinate dei pixel.
-- [ ] Verificare copertura e percentuale di pixel validi.
-- [ ] Generare un report CSV o JSON per campione.
-- [ ] Salvare viste affiancate Planet/Sentinel.
-- [ ] Salvare overlay con feature o bordi confrontabili.
-- [ ] Permettere una selezione casuale riproducibile dei campioni.
-- [ ] Fallire quando lo scostamento supera la tolleranza definita.
+- [x] Creare uno script che controlli CRS, transform, bounds, risoluzione e dimensioni.
+- [x] Verificare ordine degli assi e coordinate dei pixel.
+- [x] Verificare copertura e percentuale di pixel validi.
+- [x] Generare un report CSV o JSON per campione.
+- [x] Salvare viste affiancate Planet/Sentinel.
+- [x] Salvare overlay con feature o bordi confrontabili.
+- [x] Permettere una selezione casuale riproducibile dei campioni.
+- [x] Fallire quando lo scostamento supera la tolleranza definita.
 
 ## 9. Integrazione AUX nel modello — critico
 
-- [ ] Decidere se gli AUX devono coprire la stessa area Planet o un contesto più ampio.
-- [ ] Normalizzare DEM e slope.
-- [ ] Rappresentare aspect in forma circolare, ad esempio seno e coseno.
-- [ ] Restituire AUX dal dataset multimodale.
-- [ ] Mantenere AUX nel DataLoader.
-- [ ] Aggiungere un encoder AUX al modello.
-- [ ] Fondere le feature AUX con Planet e Sentinel.
-- [ ] Passare AUX in training, validation e inference.
-- [ ] Verificare che i parametri AUX ricevano gradienti non nulli.
-- [ ] Aggiungere un test nel quale una variazione di AUX modifica l'output.
+- [x] Decidere se gli AUX devono coprire la stessa area Planet o un contesto più ampio.
+- [x] Normalizzare DEM e slope.
+- [x] Rappresentare aspect in forma circolare, ad esempio seno e coseno.
+- [x] Restituire AUX dal dataset multimodale.
+- [x] Mantenere AUX nel DataLoader.
+- [x] Aggiungere un encoder AUX al modello.
+- [x] Fondere le feature AUX con Planet e Sentinel.
+- [x] Passare AUX in training, validation e inference.
+- [x] Verificare che i parametri AUX ricevano gradienti non nulli.
+- [x] Aggiungere un test nel quale una variazione di AUX modifica l'output.
 
 ## 10. Dataset, cache e campioni scartati
 
