@@ -46,6 +46,22 @@ class SentinelPreprocessingStaticTests(unittest.TestCase):
         }
         self.assertNotIn("credentials", module_assignments)
 
+    def test_download_windows_span_every_event_cutoff(self):
+        tree = ast.parse(
+            (ROOT / "s2_builder" / "S2_download.py").read_text(encoding="utf-8")
+        )
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in {"EVENT_CUTOFFS", "INVENTORIES"}
+        }
+        for inventory in assignments["INVENTORIES"]:
+            cutoff = assignments["EVENT_CUTOFFS"][inventory["name"]]
+            self.assertLess(inventory["start_date"][:10], cutoff)
+            self.assertLess(cutoff, inventory["end_date"][:10])
+
 
 @unittest.skipIf(combine_bands is None, "geospatial dependencies are unavailable")
 class SentinelL2APreprocessingTests(unittest.TestCase):
