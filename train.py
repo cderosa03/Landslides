@@ -11,6 +11,7 @@ import torch.optim as optim
 from models.swinunet import ChangeDetectionSwinUNet
 from dataset.landslides import PSLandslideDataset
 from dataset.lands2 import PSLandslideSentinel2Dataset
+from dataset.contracts import validate_multimodal_batch
 from dataset.multidata import MultiModalLandslideDataset
 from dataset.sampler import BalancedPosNegSampler
 
@@ -245,7 +246,7 @@ def validate(loader, model, criterion, th_metric="F1"):
     batch_contract_checked = False
     for batch in tqdm(loader, desc="Validating", ncols=100):
         if not batch_contract_checked:
-            loader.dataset.validate_batch(
+            validate_multimodal_batch(
                 batch, loader.dataset.s2_ds.n_temporal, "validation"
             )
             logger.info(
@@ -347,7 +348,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", ncols=100) as pbar:
             for batch in pbar:
                 if not batch_contract_checked:
-                    train_loader.dataset.validate_batch(
+                    validate_multimodal_batch(
                         batch, train_loader.dataset.s2_ds.n_temporal, "training"
                     )
                     logger.info(
