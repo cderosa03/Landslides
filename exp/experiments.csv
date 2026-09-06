@@ -1,0 +1,2 @@
+Timestamp,Experiment_Dir,Description,Model,Loss,Loss_Params,Optimizer,LR,Batch_Size,Epochs,Patch_Size,Best_Threshold,Best_AUPRC,Best_F1,Best_Recall,Best_Precision,Best_IoU,Validation_Loss,Train_Events,Val_Events
+2026-01-27 03:44:21,exp/swinunet_128_3,prova,ChangeDetectionSwinUNet,BCEWithLogitsLoss,training=True; reduction=mean,AdamW,0.0001,32,110,128,0.2737,0.4963,0.5060,0.4813,0.5334,0.3387,0.0172,Philippines2019;Michoacan2022;EmiliaRomagna2023,Lombok2018
