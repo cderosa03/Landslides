@@ -1,6 +1,51 @@
+import random
+
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+
+def sample_geometric_params(height, width, crop_size=None):
+    """Sample one geometric transform shared by every spatial modality."""
+    params = {
+        "hflip": random.random() < 0.5,
+        "rotation_k": random.randint(0, 3),
+        "crop": None,
+    }
+    if crop_size is not None:
+        crop_height, crop_width = crop_size
+        rotated_height, rotated_width = height, width
+        if params["rotation_k"] % 2:
+            rotated_height, rotated_width = width, height
+        if not (
+            0 < crop_height <= rotated_height
+            and 0 < crop_width <= rotated_width
+        ):
+            raise ValueError(
+                f"crop_size={crop_size} non contenuto nella forma "
+                f"spaziale {(rotated_height, rotated_width)}"
+            )
+        row = random.randint(0, rotated_height - crop_height)
+        col = random.randint(0, rotated_width - crop_width)
+        params["crop"] = (row, col, crop_height, crop_width)
+    return params
+
+
+def apply_geometric_transform(tensor, params):
+    """Apply one shared geometric transform to a tensor with H/W as last axes."""
+    if tensor.ndim < 2:
+        raise ValueError(
+            f"Una trasformazione spaziale richiede almeno due dimensioni, "
+            f"ricevute {tuple(tensor.shape)}"
+        )
+    if params["hflip"]:
+        tensor = torch.flip(tensor, dims=[-1])
+    if params["rotation_k"]:
+        tensor = torch.rot90(tensor, params["rotation_k"], dims=[-2, -1])
+    if params["crop"] is not None:
+        row, col, height, width = params["crop"]
+        tensor = tensor[..., row:row + height, col:col + width]
+    return tensor
 
 
 class MultiModalLandslideDataset(Dataset):
@@ -17,6 +62,15 @@ class MultiModalLandslideDataset(Dataset):
         self.planet_ds = planet_ds
         self.s2_ds = s2_ds
         self.apply_transform = apply_transform
+
+        if apply_transform and (
+            getattr(self.planet_ds, "apply_transform", False)
+            or getattr(self.s2_ds, "apply_transform", False)
+        ):
+            raise ValueError(
+                "Le trasformazioni multimodali devono essere centralizzate: "
+                "impostare apply_transform=False nei dataset Planet e Sentinel-2."
+            )
 
         self.aligned_indices = []
 
@@ -267,6 +321,15 @@ class MultiModalLandslideDataset(Dataset):
         planet = self.planet_ds[alignment["planet_idx"]]
         s2     = self.s2_ds[alignment["s2_idx"]]
         self._validate_sample(planet, s2, alignment)
+
+        if self.apply_transform:
+            _, height, width = planet["pre"].shape
+            params = sample_geometric_params(height, width)
+            for name in ("pre", "post", "aux", "mask"):
+                planet[name] = apply_geometric_transform(planet[name], params)
+            for name in ("pre", "post"):
+                s2[name] = apply_geometric_transform(s2[name], params)
+            self._validate_sample(planet, s2, alignment)
 
         # ── PlanetScope ───────────────────────────────────────────────────
         planet_pre  = planet["pre"]    # (C_p, H, W)

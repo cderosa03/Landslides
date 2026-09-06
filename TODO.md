@@ -19,15 +19,15 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 2. Augmentation geometrica sincronizzata — critico
 
-- [ ] Centralizzare nel dataset multimodale la generazione dei parametri casuali.
-- [ ] Estrarre una sola volta flip, rotazione ed eventuale crop per campione.
-- [ ] Applicare gli stessi parametri a Planet pre/post.
-- [ ] Applicare gli stessi parametri a tutti i frame Sentinel pre/post.
-- [ ] Applicare gli stessi parametri alla mask.
-- [ ] Applicare gli stessi parametri agli AUX spaziali.
-- [ ] Separare e documentare le trasformazioni radiometriche specifiche dei sensori.
-- [ ] Aggiungere un test sintetico con marker spaziali riconoscibili.
-- [ ] Verificare nel test che tutte le modalità restino allineate dopo l'augmentation.
+- [x] Centralizzare nel dataset multimodale la generazione dei parametri casuali.
+- [x] Estrarre una sola volta flip, rotazione ed eventuale crop per campione.
+- [x] Applicare gli stessi parametri a Planet pre/post.
+- [x] Applicare gli stessi parametri a tutti i frame Sentinel pre/post.
+- [x] Applicare gli stessi parametri alla mask.
+- [x] Applicare gli stessi parametri agli AUX spaziali.
+- [x] Separare e documentare le trasformazioni radiometriche specifiche dei sensori.
+- [x] Aggiungere un test sintetico con marker spaziali riconoscibili.
+- [x] Verificare nel test che tutte le modalità restino allineate dopo l'augmentation.
 
 ## 3. Allineamento Planet pre/post — critico
 
