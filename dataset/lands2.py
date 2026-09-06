@@ -98,8 +98,10 @@ class PSLandslideSentinel2Dataset(Dataset):
                 pre_dates  = pre_dates[-self.n_temporal:]
                 post_dates = post_dates[:self.n_temporal]
 
-                # Serve almeno una data in uno dei due gruppi
-                if not pre_dates and not post_dates:
+                # Il contratto multimodale richiede almeno una data reale
+                # in entrambe le fasi. I frame oltre quelli disponibili
+                # vengono invece gestiti con padding in _build_stack().
+                if not pre_dates or not post_dates:
                     continue
 
                 samples.append({
@@ -139,10 +141,12 @@ class PSLandslideSentinel2Dataset(Dataset):
             valid.append(True)
 
         # Padding con zeri se abbiamo meno di N_TEMPORAL date
-        if frames:
-            ref_shape = frames[0].shape   # (10, H, W)
-        else:
-            ref_shape = (10, 128, 128)    # fallback se nessuna data disponibile
+        if not frames:
+            raise RuntimeError(
+                f"Nessun frame Sentinel-2 disponibile in {s2_dir}; "
+                "il campione deve avere almeno una data reale."
+            )
+        ref_shape = frames[0].shape       # (10, H, W)
 
         while len(frames) < n:
             frames.append(torch.zeros(ref_shape, dtype=torch.float32))

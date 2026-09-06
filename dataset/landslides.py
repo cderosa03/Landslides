@@ -19,6 +19,13 @@ SLOPE_FILENAME = "slope_wide.tif"
 ASPECT_FILENAME = "aspect_wide.tif"
 MASK_FILENAME = "mask.tif"
 
+# AUX contract used by the current pipeline.  Normalization is intentionally
+# explicit: these values are still in their source units until the dedicated
+# AUX-fusion step is implemented.
+AUX_CHANNELS = ("dem", "slope", "aspect")
+AUX_UNITS = ("metres", "degrees", "degrees")
+AUX_NORMALIZATION = "raw_source_units"
+
 
 class PSLandslideDataset(Dataset):
     def __init__(self, patches_dir, events, patch_size, apply_transform=False, use_post_only=False):
@@ -157,7 +164,9 @@ class PSLandslideDataset(Dataset):
         aspect = aspect.to(torch.float32)
         mask = (mask > 0).to(torch.uint8)
 
-        # Stack auxiliary channels into a single tensor: [3,H,W]
+        # AUX channel order: DEM [m], slope [degrees], aspect [degrees].
+        # Values remain in raw source units for now; normalization belongs to
+        # the later AUX-fusion step and must be dataset-statistics based.
         aux = torch.cat([dtm, slope, aspect], dim=0)
 
         if self.apply_transform:
