@@ -140,7 +140,7 @@ planet_train = PSLandslideDataset(
     DATASET_DIR,
     TRAIN_EVENTS,
     patch_size=PATCH_SIZE,
-    apply_transform=True
+    apply_transform=False
 )
 
 planet_val = PSLandslideDataset(
@@ -154,7 +154,7 @@ planet_val = PSLandslideDataset(
 s2_train = PSLandslideSentinel2Dataset(
     DATASET_DIR,
     TRAIN_EVENTS,
-    apply_transform=True
+    apply_transform=False
 )
 
 s2_val = PSLandslideSentinel2Dataset(
