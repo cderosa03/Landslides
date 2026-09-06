@@ -6,6 +6,7 @@ import requests
 import zipfile
 
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
@@ -21,6 +22,12 @@ CREDENTIALS_PATH = Path(
     os.getenv("S2_CREDENTIALS_PATH", Path(__file__).with_name("credentials.json"))
 )
 PRODUCT_LEVEL = "MSIL2A"
+EVENT_CUTOFFS = {
+    "Lombok2018": "2018-08-05",
+    "Philippines2019": "2019-10-16",
+    "Michoacan2022": "2022-09-19",
+    "EmiliaRomagna2023": "2023-05-16",
+}
 
 ACCESS_TOKEN = None
 REFRESH_TOKEN = None
@@ -41,7 +48,7 @@ INVENTORIES = [
         "name": "Lombok2018",
         "tiles": [{"id": "T50LLR", "ron": "R003"}, {"id": "T50LMR", "ron": "R003"}],
         "start_date": "2018-06-01T00:00:00.000Z",
-        "end_date": "2018-07-01T00:00:00.000Z",
+        "end_date": "2018-10-01T00:00:00.000Z",
     },
     {
         "name": "Philippines2019",
@@ -72,6 +79,25 @@ INVENTORIES = [
         "end_date": "2023-07-01T00:00:00.000Z",
     },
 ]
+
+
+def validate_inventory_windows(inventories):
+    """Ensure every download window includes acquisitions before and after its event."""
+    names = {inventory["name"] for inventory in inventories}
+    unknown = names - EVENT_CUTOFFS.keys()
+    missing = EVENT_CUTOFFS.keys() - names
+    if unknown or missing:
+        raise ValueError(f"Inventory/cutoff mismatch: unknown={unknown}, missing={missing}")
+
+    for inventory in inventories:
+        start = datetime.fromisoformat(inventory["start_date"][:10]).date()
+        end = datetime.fromisoformat(inventory["end_date"][:10]).date()
+        cutoff = datetime.fromisoformat(EVENT_CUTOFFS[inventory["name"]]).date()
+        if not start < cutoff < end:
+            raise ValueError(
+                f"{inventory['name']}: download window {start}..{end} does not span {cutoff}"
+            )
+        logging.info("Validated temporal window for %s: %s < %s < %s", inventory["name"], start, cutoff, end)
 
 def get_access_token(username: str, password: str):
     """Request a new access_token and refresh_token."""
@@ -249,6 +275,7 @@ def unzip_product(zip_path: Path):
 
 
 def main():
+    validate_inventory_windows(INVENTORIES)
     credentials = None
     for inventory in INVENTORIES:
         inventory_name = inventory["name"]

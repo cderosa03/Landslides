@@ -68,12 +68,12 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 7. Selezione temporale
 
-- [ ] Richiedere almeno un frame reale sia pre sia post, salvo diversa decisione documentata.
-- [ ] Correggere l'intervallo di download Lombok per includere acquisizioni post-evento.
-- [ ] Validare automaticamente intervalli di download e cutoff di tutti gli eventi.
-- [ ] Salvare o registrare nei log le date selezionate per ogni campione.
-- [ ] Definire una distanza temporale massima dall'evento.
-- [ ] Rendere esplicita la politica per campioni temporalmente incompleti.
+- [x] Richiedere almeno un frame reale sia pre sia post, salvo diversa decisione documentata.
+- [x] Correggere l'intervallo di download Lombok per includere acquisizioni post-evento.
+- [x] Validare automaticamente intervalli di download e cutoff di tutti gli eventi.
+- [x] Salvare o registrare nei log le date selezionate per ogni campione.
+- [x] Definire una distanza temporale massima dall'evento.
+- [x] Rendere esplicita la politica per campioni temporalmente incompleti.
 
 ## 8. Diagnostica geospaziale riproducibile
 

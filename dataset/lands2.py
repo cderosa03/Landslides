@@ -1,8 +1,11 @@
+import logging
 import numpy as np
+import os
 import torch
 import rasterio
 import random
 import torchvision.transforms.functional as TF
+from datetime import datetime
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -10,6 +13,13 @@ from tqdm import tqdm
 
 # ── Parametri temporali ────────────────────────────────────────────────────
 N_TEMPORAL = 6   # numero di immagini pre e post da caricare
+MAX_EVENT_DISTANCE_DAYS = int(os.getenv("S2_MAX_EVENT_DISTANCE_DAYS", "90"))
+REQUIRE_BOTH_TEMPORAL_SIDES = True
+
+if MAX_EVENT_DISTANCE_DAYS < 0:
+    raise ValueError("S2_MAX_EVENT_DISTANCE_DAYS must be non-negative")
+
+logger = logging.getLogger(__name__)
 
 # Data di taglio pre/post per ogni inventario (YYYYMMDD).
 EVENT_CUTOFFS = {
@@ -18,6 +28,20 @@ EVENT_CUTOFFS = {
     "Michoacan2022":     "20220919",
     "EmiliaRomagna2023": "20230516",
 }
+
+
+def select_temporal_dates(all_dates, cutoff, n_temporal):
+    """Select real frames within the configured temporal distance from an event."""
+    cutoff_date = datetime.strptime(cutoff, "%Y%m%d").date()
+    eligible_dates = [
+        date_str
+        for date_str in all_dates
+        if abs((datetime.strptime(date_str, "%Y%m%d").date() - cutoff_date).days)
+        <= MAX_EVENT_DISTANCE_DAYS
+    ]
+    pre_dates = [date_str for date_str in eligible_dates if date_str < cutoff]
+    post_dates = [date_str for date_str in eligible_dates if date_str >= cutoff]
+    return pre_dates[-n_temporal:], post_dates[:n_temporal]
 
 
 class PSLandslideSentinel2Dataset(Dataset):
@@ -92,18 +116,34 @@ class PSLandslideSentinel2Dataset(Dataset):
                     continue
 
                 # Dividi in pre e post rispetto al cutoff
-                pre_dates  = [d for d in all_dates if d < cutoff]
-                post_dates = [d for d in all_dates if d >= cutoff]
+                pre_dates, post_dates = select_temporal_dates(
+                    all_dates, cutoff, self.n_temporal
+                )
 
                 # Tieni le N più recenti pre e le N più vecchie post
-                pre_dates  = pre_dates[-self.n_temporal:]
-                post_dates = post_dates[:self.n_temporal]
 
                 # Il contratto multimodale richiede almeno una data reale
                 # in entrambe le fasi. I frame oltre quelli disponibili
                 # vengono invece gestiti con padding in _build_stack().
-                if not pre_dates or not post_dates:
+                if REQUIRE_BOTH_TEMPORAL_SIDES and (not pre_dates or not post_dates):
+                    logger.info(
+                        "Skipping %s/%s: incomplete temporal pair within %s days "
+                        "(pre=%s, post=%s)",
+                        event,
+                        patch_dir.name,
+                        MAX_EVENT_DISTANCE_DAYS,
+                        pre_dates,
+                        post_dates,
+                    )
                     continue
+
+                logger.info(
+                    "Selected Sentinel dates for %s/%s: pre=%s post=%s",
+                    event,
+                    patch_dir.name,
+                    pre_dates,
+                    post_dates,
+                )
 
                 samples.append({
                     "event":      event,
