@@ -56,7 +56,7 @@ def validate_multimodal_sample(planet, sentinel, alignment, n_temporal):
     _, height, width = planet_pre.shape
     expected_shapes = {
         "planet_post": (3, height, width),
-        "aux": (3, height, width),
+        "aux": (4, height, width),
         "mask": (1, height, width),
         "s2_pre": (n_temporal, 10, height, width),
         "s2_post": (n_temporal, 10, height, width),
@@ -106,7 +106,7 @@ def validate_multimodal_batch(batch, n_temporal, loader_name):
     batch_size, _, height, width = planet_pre.shape
     expected_shapes = {
         "planet_post": (batch_size, 3, height, width),
-        "aux": (batch_size, 3, height, width),
+        "aux": (batch_size, 4, height, width),
         "mask": (batch_size, 1, height, width),
         "s2_pre": (batch_size, n_temporal, 10, height, width),
         "s2_post": (batch_size, n_temporal, 10, height, width),
@@ -120,4 +120,3 @@ def validate_multimodal_batch(batch, n_temporal, loader_name):
     }
     if wrong_shapes:
         raise ValueError(f"Batch {loader_name}: forme errate {wrong_shapes}")
-

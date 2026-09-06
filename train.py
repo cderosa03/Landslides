@@ -258,7 +258,7 @@ def validate(loader, model, criterion, th_metric="F1"):
                 },
                 [
                     "s2_pre", "s2_post", "planet_pre", "planet_post",
-                    "s2_valid_pre", "s2_valid_post",
+                    "aux", "s2_valid_pre", "s2_valid_post",
                 ],
             )
             batch_contract_checked = True
@@ -269,6 +269,7 @@ def validate(loader, model, criterion, th_metric="F1"):
             batch["s2_post"].to(device, non_blocking=True),
             batch["planet_pre"].to(device, non_blocking=True),
             batch["planet_post"].to(device, non_blocking=True),
+            batch["aux"].to(device, non_blocking=True),
             valid_t1=batch["s2_valid_pre"].to(device, non_blocking=True),
             valid_t2=batch["s2_valid_post"].to(device, non_blocking=True),
         )
@@ -322,6 +323,35 @@ writer = SummaryWriter(log_dir=EXPERIMENT_DIR / "logs")
 
 
 # -------------------- TRAIN LOOP ---------------------
+def load_model_state(model, state_dict):
+    """Load an old no-AUX checkpoint without discarding its learned fusion weights."""
+    target_state = model.state_dict()
+    compatible = {}
+    expanded_fusions = []
+
+    for name, source in state_dict.items():
+        target = target_state.get(name)
+        if target is None:
+            continue
+        if source.shape == target.shape:
+            compatible[name] = source
+        elif (
+            name.startswith("fusion_stages.")
+            and source.ndim == target.ndim == 4
+            and source.shape[0] == target.shape[0]
+            and source.shape[1] < target.shape[1]
+            and source.shape[2:] == target.shape[2:]
+        ):
+            migrated = target.clone()
+            migrated[:, :source.shape[1]] = source
+            compatible[name] = migrated
+            expanded_fusions.append(name)
+
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    migrated = bool(expanded_fusions or missing or unexpected)
+    return migrated, missing, unexpected, expanded_fusions
+
+
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs):
     best_model_score = 0
     best_threshold = 0.5
@@ -331,14 +361,31 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
     checkpoint_path = EXPERIMENT_DIR / "checkpoint_last.pth"
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        best_model_score = checkpoint['best_model_score']
-        best_threshold = checkpoint['best_threshold']
-        start_epoch = checkpoint['epoch'] + 1
-        epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
-        logger.info(f"Ripreso dal checkpoint: epoca {start_epoch}, epoche senza miglioramento: {epochs_without_improvement}")
+        migrated, missing, unexpected, expanded = load_model_state(
+            model, checkpoint["model_state_dict"]
+        )
+        if migrated:
+            logger.warning(
+                "Checkpoint precedente migrato: riusati i pesi compatibili; "
+                "AUX e nuove colonne di fusione sono inizializzati. "
+                "Optimizer, scheduler ed epoca ripartono da zero. "
+                "missing=%s, unexpected=%s, fusion=%s",
+                missing,
+                unexpected,
+                expanded,
+            )
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            best_model_score = checkpoint["best_model_score"]
+            best_threshold = checkpoint["best_threshold"]
+            start_epoch = checkpoint["epoch"] + 1
+            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+            logger.info(
+                "Ripreso dal checkpoint: epoca %s, epoche senza miglioramento: %s",
+                start_epoch,
+                epochs_without_improvement,
+            )
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -360,7 +407,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
                         },
                         [
                             "s2_pre", "s2_post", "planet_pre", "planet_post",
-                            "s2_valid_pre", "s2_valid_post",
+                            "aux", "s2_valid_pre", "s2_valid_post",
                         ],
                     )
                     batch_contract_checked = True
@@ -372,6 +419,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
                     batch["s2_post"].to(device),
                     batch["planet_pre"].to(device),
                     batch["planet_post"].to(device),
+                    batch["aux"].to(device),
                     valid_t1=batch["s2_valid_pre"].to(device),
                     valid_t2=batch["s2_valid_post"].to(device),
                 )

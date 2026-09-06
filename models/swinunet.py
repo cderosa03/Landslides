@@ -176,6 +176,42 @@ class SwinEncoder(nn.Module):
         return [f.permute(0, 3, 1, 2) for f in feats]
 
 
+class AuxPyramidEncoder(nn.Module):
+    """Lightweight terrain encoder aligned to the four Swin feature scales."""
+
+    @staticmethod
+    def _block(in_channels, out_channels, kernel_size, stride):
+        groups = min(8, out_channels)
+        while out_channels % groups:
+            groups -= 1
+        return nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=kernel_size // 2 if kernel_size == 3 else 0,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, out_channels),
+            nn.GELU(),
+        )
+
+    def __init__(self, in_channels, channels):
+        super().__init__()
+        self.stem = self._block(in_channels, channels[0], kernel_size=4, stride=4)
+        self.downsamples = nn.ModuleList(
+            self._block(channels[index - 1], channels[index], kernel_size=3, stride=2)
+            for index in range(1, len(channels))
+        )
+
+    def forward(self, aux):
+        features = [self.stem(aux)]
+        for layer in self.downsamples:
+            features.append(layer(features[-1]))
+        return features
+
+
 # Modello principale
 
 class ChangeDetectionSwinUNet(nn.Module):
@@ -193,7 +229,9 @@ class ChangeDetectionSwinUNet(nn.Module):
       p_t1 / p_t2 : (B, C_p, H, W)
     """
 
-    def __init__(self, img_size=128, num_classes=1, model_size="small"):
+    def __init__(
+        self, img_size=128, num_classes=1, model_size="small", aux_channels=4
+    ):
         super().__init__()
         self.img_size = img_size
 
@@ -215,10 +253,12 @@ class ChangeDetectionSwinUNet(nn.Module):
         )
 
         enc_channels = self.s2_encoder.out_channels  # [96, 192, 384, 768]
+        self.aux_channels = aux_channels
+        self.aux_encoder = AuxPyramidEncoder(aux_channels, enc_channels)
 
         # ── Moduli di fusione (uno per stage) ────────────────────────────
         self.fusion_stages = nn.ModuleList([
-            DiffFusionModule(2 * ch, ch) for ch in enc_channels
+            DiffFusionModule(3 * ch, ch) for ch in enc_channels
         ])
 
         # ── Decoder Transformer ──────────────────────────────────────────
@@ -254,11 +294,12 @@ class ChangeDetectionSwinUNet(nn.Module):
         return result
 
     # ── Forward ──────────────────────────────────────────────────────────
-    def forward(self, s2_t1, s2_t2, p_t1, p_t2,
+    def forward(self, s2_t1, s2_t2, p_t1, p_t2, aux,
                 valid_t1=None, valid_t2=None):
         """
         s2_t1, s2_t2   : (B, T, 10, H, W)  serie temporale Sentinel-2
         p_t1,  p_t2    : (B, C_p,  H, W)   PlanetScope pre/post
+        aux             : (B, 4, H, W)      contesto topografico normalizzato
         valid_t1/t2    : (B, T) bool        maschera frame validi (None = tutti validi)
         """
         B, T, C, H, W = s2_t1.shape
@@ -286,13 +327,23 @@ class ChangeDetectionSwinUNet(nn.Module):
         # ── Encoding PlanetScope (singola immagine, invariato) ───────────
         p_f1 = self.planet_encoder(p_t1)   # list[4 × (B, C, H, W)]
         p_f2 = self.planet_encoder(p_t2)
+        if aux.ndim != 4 or aux.shape[1] != self.aux_channels:
+            raise ValueError(
+                f"aux atteso (B,{self.aux_channels},H,W), ricevuto {tuple(aux.shape)}"
+            )
+        aux_features = self.aux_encoder(aux)
 
         # ── Fusione: differenza S2 + differenza Planet → DiffFusionModule ─
         fused = []
         for i in range(len(s2_f1)):
             diff_s2 = s2_f2[i] - s2_f1[i]          # cambiamento S2
             diff_p  = p_f2[i]  - p_f1[i]           # cambiamento Planet
-            f = torch.cat([diff_s2, diff_p], dim=1)  # (B, 2C, H, W)
+            if aux_features[i].shape != diff_p.shape:
+                raise ValueError(
+                    f"AUX stage {i} non allineato: {tuple(aux_features[i].shape)} vs "
+                    f"{tuple(diff_p.shape)}"
+                )
+            f = torch.cat([diff_s2, diff_p, aux_features[i]], dim=1)
             fused.append(self.fusion_stages[i](f))   # (B, C, H, W)
 
         # ── Decoder → logit per pixel ─────────────────────────────────────
