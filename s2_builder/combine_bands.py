@@ -15,15 +15,15 @@ from rasterio.warp import calculate_default_transform, reproject
 from rasterio.windows import Window
 
 
-os.environ["PROJ_LIB"] = "/home/jovyan/nfs/mgatti/python/landslides-detection/.venv/lib/python3.11/site-packages/pyproj/proj_dir/share/proj"
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-IMAGES_PATH = Path("/home/jovyan/nfs/tesista3/landslide-detection/Landslides/Sentinel/images/")
-ANNOTATIONS_PATH = Path("inventories")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+IMAGES_PATH = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
+ANNOTATIONS_PATH = Path(os.getenv("INVENTORIES_PATH", PROJECT_ROOT / "inventories"))
+PRODUCT_LEVEL = "MSIL2A"
 
 PRODUCTS_10m = ["B02_10m", "B03_10m", "B04_10m", "B08_10m"]
 DESCRIPTIONS_10m = ["Band 2 - Blue", "Band 3 - Green", "Band 4 - Red", "Band 8 - NIR"]
@@ -45,11 +45,6 @@ DESCRIPTIONS_20m = [
     "Band 11 - SWIR",
     "Band 12 - SWIR"
 ]
-
-PRODUCTS_60m = ["B01_60m", "B09_60m", "B10_60m"]
-DESCRIPTIONS_60m = ["Band 1 - Coastal aerosol", "Band 9 - Water vapour", "Band 10 - SWIR - Cirrus"]
-
-PRODUCT_LEVELS = ["MSIL1C", "MSIL2A"]
 
 annotations = {}
 
@@ -178,7 +173,9 @@ def read_crop_band(band_path, shapefile_path=None):
         return band_array, transform, src.profile.copy(), crop_size
 
 
-def write_combined_raster(band_arrays, transform, profile, output_path, descriptions):
+def write_combined_raster(
+    band_arrays, transform, profile, output_path, descriptions, source_metadata
+):
     """Write a multi-band raster with metadata and band descriptions."""
     profile.update({
         "height": band_arrays[0].shape[0],
@@ -195,11 +192,14 @@ def write_combined_raster(band_arrays, transform, profile, output_path, descript
         for i, arr in enumerate(band_arrays):
             dst.write(arr, i + 1)
             dst.set_band_description(i + 1, descriptions[i])
+        dst.update_tags(**source_metadata)
 
     logging.info(f"Multi-band raster saved as {output_path}")
 
 
-def combine_bands(input_bands, band_descriptions, output_path, shapefile_path=None):
+def combine_bands(
+    input_bands, band_descriptions, output_path, source_metadata, shapefile_path=None
+):
     """Read, crop, and stack bands into a single raster."""
     if output_path.exists():
         logging.info(f"Skipping existing file: {output_path}")
@@ -219,7 +219,14 @@ def combine_bands(input_bands, band_descriptions, output_path, shapefile_path=No
 
             band_arrays.append(band_array)
 
-        write_combined_raster(band_arrays, transform, profile, output_path, band_descriptions)
+        write_combined_raster(
+            band_arrays,
+            transform,
+            profile,
+            output_path,
+            band_descriptions,
+            source_metadata,
+        )
 
     except Exception as e:
         logging.error(f"Failed to combine bands: {e}")
@@ -252,7 +259,9 @@ def process_tile_level(tile, product_level, gpkg_path):
     if not level_dir.exists():
         return
 
-    date_dirs = [d for d in level_dir.iterdir() if d.is_dir()]
+    date_dirs = sorted(
+        d for d in level_dir.iterdir() if d.is_dir() and "_MSIL2A_" in d.name
+    )
     out_tile_dir = tile.parent / "combined" / tile.name / product_level
 
     for date_dir in date_dirs:
@@ -260,23 +269,34 @@ def process_tile_level(tile, product_level, gpkg_path):
         out_date_dir = out_tile_dir / date_str
         out_date_dir.mkdir(parents=True, exist_ok=True)
 
-        process_band_groups(date_dir, out_date_dir, product_level, gpkg_path)
+        process_band_groups(date_dir, out_date_dir, tile.name, gpkg_path)
         save_sen2cor_mask(date_dir, out_date_dir)
 
-        if product_level == "MSIL2A":
-            generate_dtm_and_annotation(date_str, out_date_dir, gpkg_path, out_tile_dir)
+        generate_dtm_and_annotation(date_str, out_date_dir, gpkg_path, out_tile_dir)
 
 
-def process_band_groups(date_dir, out_dir, level, gpkg_path):
+def find_l2a_band(date_dir, band, resolution):
+    """Return the sole L2A JP2 matching its exact band and resolution."""
+    matches = sorted(date_dir.rglob(f"*_{band}_{resolution}.jp2"))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected one {band}_{resolution} file in {date_dir}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def process_band_groups(date_dir, out_dir, tile_name, gpkg_path):
     date_str = date_dir.name.split("_")[2][:8]
-    products_60m = PRODUCTS_60m if level == "MSIL1C" else PRODUCTS_60m[:-1]
-    descriptions_60m = DESCRIPTIONS_60m if level == "MSIL1C" else DESCRIPTIONS_60m[:-1]
-
     band_groups = [
         (PRODUCTS_10m, DESCRIPTIONS_10m, f"{date_str}_10m.tif"),
         (PRODUCTS_20m, DESCRIPTIONS_20m, f"{date_str}_20m.tif"),
-        (products_60m, descriptions_60m, f"{date_str}_60m.tif"),
     ]
+    source_metadata = {
+        "s2_level": PRODUCT_LEVEL,
+        "s2_tile": tile_name,
+        "s2_acquisition_date": date_str,
+        "s2_product": date_dir.name,
+    }
 
     for products, descs, fname in band_groups:
         out_file = out_dir / fname
@@ -284,10 +304,18 @@ def process_band_groups(date_dir, out_dir, level, gpkg_path):
             logging.info(f"Skipping existing file: {out_file}")
             continue
         try:
-            band_paths = [list(date_dir.rglob(f"*{p.split('_')[0]}.jp2"))[0] for p in products]
-            combine_bands(band_paths, descs, out_file, gpkg_path)
-        except IndexError:
-            logging.warning(f"Missing product in {date_dir}: {products}")
+            band_paths = [
+                find_l2a_band(date_dir, *product.split("_")) for product in products
+            ]
+            combine_bands(
+                band_paths,
+                descs,
+                out_file,
+                {**source_metadata, "s2_band_order": ",".join(products)},
+                gpkg_path,
+            )
+        except RuntimeError as error:
+            logging.warning("Cannot build %s: %s", out_file, error)
 
 
 def save_sen2cor_mask(date_dir, out_dir):
@@ -348,8 +376,7 @@ def process_inventory(inventory_path):
         return
 
     for tile in inventory_path.glob("T[0-9][0-9]*"):
-        for level in PRODUCT_LEVELS:
-            process_tile_level(tile, level, gpkg_path)
+        process_tile_level(tile, PRODUCT_LEVEL, gpkg_path)
 
 
 if __name__ == "__main__":

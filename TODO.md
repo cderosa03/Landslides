@@ -40,13 +40,13 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 4. Preprocessing Sentinel-2
 
-- [ ] Scegliere esplicitamente il livello Sentinel da utilizzare, preferibilmente L2A.
-- [ ] Correggere la ricerca dei nomi delle bande L2A.
-- [ ] Verificare ordine e presenza delle dieci bande.
-- [ ] Impedire il mescolamento o la sovrascrittura silenziosa di L1C e L2A.
-- [ ] Conservare livello, tile, data e prodotto sorgente nei metadati.
-- [ ] Rendere configurabili i percorsi attualmente hardcoded.
-- [ ] Caricare le credenziali solo durante il download, non all'import del modulo.
+- [x] Scegliere esplicitamente il livello Sentinel da utilizzare, preferibilmente L2A.
+- [x] Correggere la ricerca dei nomi delle bande L2A.
+- [x] Verificare ordine e presenza delle dieci bande.
+- [x] Impedire il mescolamento o la sovrascrittura silenziosa di L1C e L2A.
+- [x] Conservare livello, tile, data e prodotto sorgente nei metadati.
+- [x] Rendere configurabili i percorsi attualmente hardcoded.
+- [x] Caricare le credenziali solo durante il download, non all'import del modulo.
 
 ## 5. Gestione di più tile Sentinel — critico
 
