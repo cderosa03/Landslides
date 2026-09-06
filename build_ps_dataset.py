@@ -35,6 +35,7 @@ from osgeo import gdal
 from rasterio.features import rasterize
 from rasterio.merge import merge
 from rasterio.transform import Affine
+from rasterio.vrt import WarpedVRT
 from rasterio.warp import (
     Resampling,
     calculate_default_transform,
@@ -676,27 +677,81 @@ def rasterize_clouds(inv: Inventory, base_dir: Path) -> None:
 # ======================================================================================
 
 
-def check_alignment(paths: List[Path]) -> bool:
-    """Ensure all rasters share the same shape, transform, and CRS."""
+def alignment_issues(reference, source) -> List[str]:
+    """List CRS, bounds, resolution, shape, or transform mismatches."""
+    issues = []
+    if reference.crs != source.crs:
+        issues.append("CRS")
+    if (reference.height, reference.width) != (source.height, source.width):
+        issues.append("dimensioni")
+    if not reference.transform.almost_equals(source.transform):
+        issues.append("transform affine")
+    if not np.allclose(reference.res, source.res, rtol=0, atol=1e-9):
+        issues.append("risoluzione")
+    if not np.allclose(reference.bounds, source.bounds, rtol=0, atol=1e-6):
+        issues.append("bounding box")
+    return issues
 
-    metas = []
-    for path in paths:
-        with rasterio.open(path) as src:
-            metas.append((path.name, src.shape, src.transform, src.crs))
 
-    ok = True
-    _, shape0, transform0, crs0 = metas[0]
-    for name, shape, transform, crs in metas[1:]:
-        if shape != shape0:
-            LOG.warning("Shape mismatch: %s %s vs %s", name, shape, shape0)
-            ok = False
-        if (np.asarray(transform) != np.asarray(transform0)).any():
-            LOG.warning("Transform mismatch: %s", name)
-            ok = False
-        if crs != crs0:
-            LOG.warning("CRS mismatch: %s %s vs %s", name, crs, crs0)
-            ok = False
-    return ok
+def align_to_reference(stack, source, reference, name, resampling):
+    """Return source or a WarpedVRT exactly on the Planet pre grid."""
+    issues = alignment_issues(reference, source)
+    if not issues:
+        return source
+    if reference.crs is None or source.crs is None:
+        raise ValueError(
+            f"{name} non allineato e senza CRS: {', '.join(issues)}"
+        )
+    LOG.info("Riproietto %s sulla griglia Planet pre: %s", name, ", ".join(issues))
+    return stack.enter_context(
+        WarpedVRT(
+            source,
+            crs=reference.crs,
+            transform=reference.transform,
+            width=reference.width,
+            height=reference.height,
+            resampling=resampling,
+            src_nodata=source.nodata,
+            nodata=source.nodata,
+        )
+    )
+
+
+@contextlib.contextmanager
+def aligned_sources(files):
+    """Open patching inputs, viewing each spatial raster on the pre grid."""
+    with rasterio.Env(GDAL_CACHEMAX=1024), contextlib.ExitStack() as stack:
+        pre = stack.enter_context(rasterio.open(files["pre"]))
+        if pre.crs is None:
+            raise ValueError("pre_merged.tif senza CRS")
+
+        def aligned(key, resampling):
+            source = stack.enter_context(rasterio.open(files[key]))
+            return align_to_reference(stack, source, pre, key, resampling)
+
+        def optional(key, resampling):
+            return aligned(key, resampling) if files[key].exists() else None
+
+        sources = {
+            "pre": pre,
+            "post": aligned("post", Resampling.bilinear),
+            "mask": aligned("mask", Resampling.nearest),
+            "dem": aligned("dem", Resampling.bilinear),
+            "cloud_pre": optional("cloud_pre", Resampling.nearest),
+            "cloud_post": optional("cloud_post", Resampling.nearest),
+            "area": optional("area", Resampling.nearest),
+            "slope": optional("slope", Resampling.bilinear),
+            "aspect": optional("aspect", Resampling.bilinear),
+        }
+        for key in ("dem_native", "slope_native", "aspect_native"):
+            if files[key].exists():
+                source = stack.enter_context(rasterio.open(files[key]))
+                if source.crs != pre.crs:
+                    raise ValueError(f"{key} CRS diverso dalla griglia Planet pre")
+                sources[key] = source
+            else:
+                sources[key] = None
+        yield sources
 
 
 def grid_from_shape(
@@ -861,135 +916,114 @@ def generate_patches(
         )
         return
 
-    to_check = [files["pre"], files["post"], files["mask"]]
-    for key in ("cloud_pre", "cloud_post", "area"):
-        if files[key].exists():
-            to_check.append(files[key])
+    with aligned_sources(files) as sources:
+        pre_ds = sources["pre"]
+        post_ds = sources["post"]
+        mask_ds = sources["mask"]
+        dem_ds = sources["dem"]
+        cloud_pre_ds = sources["cloud_pre"]
+        cloud_post_ds = sources["cloud_post"]
+        area_ds = sources["area"]
+        slope_ds = sources["slope"]
+        aspect_ds = sources["aspect"]
+        dem_nat_ds = sources["dem_native"]
+        slp_nat_ds = sources["slope_native"]
+        asp_nat_ds = sources["aspect_native"]
 
-    if not check_alignment(to_check):
-        LOG.warning("Alignment issues detected for %s. Proceeding anyway.", name)
+        height, width = pre_ds.shape
+        n_rows, n_cols = grid_from_shape(height, width, patch_size, stride)
+        total_patches = n_rows * n_cols
+        patch_subdir.mkdir(parents=True, exist_ok=True)
+        LOG.info("Generating patches for %s (total possible: %d)", name, total_patches)
 
-    with rasterio.Env(GDAL_CACHEMAX=1024):
-        with rasterio.open(files["pre"]) as pre_ds, \
-             rasterio.open(files["post"]) as post_ds, \
-             rasterio.open(files["mask"]) as mask_ds, \
-             rasterio.open(files["dem"]) as dem_ds, \
-             (rasterio.open(files["cloud_pre"]) if files["cloud_pre"].exists() else contextlib.nullcontext(None)) as cloud_pre_ds, \
-             (rasterio.open(files["cloud_post"]) if files["cloud_post"].exists() else contextlib.nullcontext(None)) as cloud_post_ds, \
-             (rasterio.open(files["area"]) if files["area"].exists() else contextlib.nullcontext(None)) as area_ds, \
-             (rasterio.open(files["slope"]) if files["slope"].exists() else contextlib.nullcontext(None)) as slope_ds, \
-             (rasterio.open(files["aspect"]) if files["aspect"].exists() else contextlib.nullcontext(None)) as aspect_ds, \
-             (rasterio.open(files["dem_native"]) if files["dem_native"].exists() else contextlib.nullcontext(None)) as dem_nat_ds, \
-             (rasterio.open(files["slope_native"]) if files["slope_native"].exists() else contextlib.nullcontext(None)) as slp_nat_ds, \
-             (rasterio.open(files["aspect_native"]) if files["aspect_native"].exists() else contextlib.nullcontext(None)) as asp_nat_ds:
+        saved = 0
+        with tqdm(total=total_patches, desc=f"{name} patches") as pbar:
+            for i_idx, j_idx, window, patch_transform in iter_windows(
+                n_rows, n_cols, patch_size, stride, pre_ds.transform
+            ):
+                pre = drop_alpha_if_present(pre_ds.read(window=window), pre_ds)
+                post = drop_alpha_if_present(post_ds.read(window=window), post_ds)
+                mask = mask_ds.read(1, window=window).astype("uint8")
 
-            height, width = mask_ds.shape
-            n_rows, n_cols = grid_from_shape(height, width, patch_size, stride)
-            total_patches = n_rows * n_cols
+                if area_ds is not None:
+                    area = area_ds.read(1, window=window).astype("uint8")
+                    if area.sum() == 0:
+                        pbar.update(1)
+                        continue
+                    mask = np.where(area == 1, mask, 0)
+                    pre = np.where(area[None, ...] == 1, pre, np.nan)
+                    post = np.where(area[None, ...] == 1, post, np.nan)
 
-            patch_subdir.mkdir(parents=True, exist_ok=True)
-            LOG.info("Generating patches for %s (total possible: %d)", name, total_patches)
+                if np.isnan(pre).any() or np.isnan(post).any():
+                    pbar.update(1)
+                    continue
 
-            saved = 0
-            desc = f"{name} patches"
-            with tqdm(total=total_patches, desc=desc) as pbar:
-                for i_idx, j_idx, window, patch_transform in iter_windows(
-                    n_rows, n_cols, patch_size, stride, pre_ds.transform
+                if (
+                    cloud_pre_ds is not None
+                    and cloud_post_ds is not None
+                    and cloud_skip_threshold is not None
                 ):
-                    pre = pre_ds.read(window=window)
-                    pre = drop_alpha_if_present(pre, pre_ds)
-
-                    post = post_ds.read(window=window)
-                    post = drop_alpha_if_present(post, post_ds)
-
-                    mask = mask_ds.read(1, window=window).astype("uint8")
-
-                    if area_ds is not None:
-                        area = area_ds.read(1, window=window).astype("uint8")
-                        if area.sum() == 0:
-                            pbar.update(1)
-                            continue
-                        mask = np.where(area == 1, mask, 0)
-                        pre = np.where(area[None, ...] == 1, pre, np.nan)
-                        post = np.where(area[None, ...] == 1, post, np.nan)
-
-                    if np.isnan(pre).any() or np.isnan(post).any():
-                        pbar.update(1)
-                        continue
-
                     if (
-                        cloud_pre_ds is not None
-                        and cloud_post_ds is not None
-                        and cloud_skip_threshold is not None
+                        cloud_pre_ds.read(1, window=window).mean() > cloud_skip_threshold
+                        or cloud_post_ds.read(1, window=window).mean() > cloud_skip_threshold
                     ):
-                        cpre = cloud_pre_ds.read(1, window=window).astype("uint8")
-                        cpost = cloud_post_ds.read(1, window=window).astype("uint8")
-                        frac_pre = cpre.mean()
-                        frac_post = cpost.mean()
-                        if (frac_pre > cloud_skip_threshold) or (
-                            frac_post > cloud_skip_threshold
-                        ):
-                            pbar.update(1)
-                            continue
-
-                    if skip_negatives and mask.max() == 0:
                         pbar.update(1)
                         continue
 
-                    saved += 1
-                    out_dir = patch_subdir / str(saved)
-                    out_dir.mkdir(parents=True, exist_ok=True)
+                if skip_negatives and mask.max() == 0:
+                    pbar.update(1)
+                    continue
 
-                    _write_geotiff(out_dir / "pre.tif", pre, pre_ds.crs, patch_transform)
-                    _write_geotiff(out_dir / "post.tif", post, post_ds.crs, patch_transform)
-                    _write_geotiff(out_dir / "mask.tif", mask, mask_ds.crs, patch_transform)
+                saved += 1
+                out_dir = patch_subdir / str(saved)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                _write_geotiff(out_dir / "pre.tif", pre, pre_ds.crs, patch_transform)
+                _write_geotiff(out_dir / "post.tif", post, pre_ds.crs, patch_transform)
+                _write_geotiff(out_dir / "mask.tif", mask, pre_ds.crs, patch_transform)
+                _write_window_from_src(dem_ds, out_dir / "dem.tif", window, patch_transform)
 
-                    _write_window_from_src(dem_ds, out_dir / "dem.tif", window, patch_transform)
-                    if slope_ds is not None:
-                        _write_window_from_src(
-                            slope_ds, out_dir / "slope.tif", window, patch_transform
-                        )
-                    if aspect_ds is not None:
-                        _write_window_from_src(
-                            aspect_ds, out_dir / "aspect.tif", window, patch_transform
-                        )
+                if slope_ds is not None:
+                    _write_window_from_src(
+                        slope_ds, out_dir / "slope.tif", window, patch_transform
+                    )
+                if aspect_ds is not None:
+                    _write_window_from_src(
+                        aspect_ds, out_dir / "aspect.tif", window, patch_transform
+                    )
 
-                    # Native wide context rasters (if available)
-                    if dem_nat_ds is not None:
-                        win_nat, wtransform_nat = _center_native_window(
-                            pre_ds.transform, i_idx, j_idx, patch_size, stride, dem_nat_ds
-                        )
+                if dem_nat_ds is not None:
+                    win_nat, wtransform_nat = _center_native_window(
+                        pre_ds.transform, i_idx, j_idx, patch_size, stride, dem_nat_ds
+                    )
 
-                        def _fill_for(ds: rasterio.io.DatasetReader):
-                            is_float = np.issubdtype(np.dtype(ds.dtypes[0]), np.floating)
-                            return ds.nodata if ds.nodata is not None else (np.nan if is_float else 0)
+                    def _fill_for(ds: rasterio.io.DatasetReader):
+                        is_float = np.issubdtype(np.dtype(ds.dtypes[0]), np.floating)
+                        return ds.nodata if ds.nodata is not None else (np.nan if is_float else 0)
 
-                        dem_wide = dem_nat_ds.read(
-                            1, window=win_nat, boundless=True, fill_value=_fill_for(dem_nat_ds)
+                    dem_wide = dem_nat_ds.read(
+                        1, window=win_nat, boundless=True, fill_value=_fill_for(dem_nat_ds)
+                    )
+                    _write_geotiff(
+                        out_dir / "dem_wide.tif", dem_wide, dem_nat_ds.crs, wtransform_nat
+                    )
+                    if slp_nat_ds is not None:
+                        slp_wide = slp_nat_ds.read(
+                            1, window=win_nat, boundless=True, fill_value=_fill_for(slp_nat_ds)
                         )
                         _write_geotiff(
-                            out_dir / "dem_wide.tif", dem_wide, dem_nat_ds.crs, wtransform_nat
+                            out_dir / "slope_wide.tif", slp_wide, slp_nat_ds.crs, wtransform_nat
+                        )
+                    if asp_nat_ds is not None:
+                        asp_wide = asp_nat_ds.read(
+                            1, window=win_nat, boundless=True, fill_value=_fill_for(asp_nat_ds)
+                        )
+                        _write_geotiff(
+                            out_dir / "aspect_wide.tif", asp_wide, asp_nat_ds.crs, wtransform_nat
                         )
 
-                        if slp_nat_ds is not None:
-                            slp_wide = slp_nat_ds.read(
-                                1, window=win_nat, boundless=True, fill_value=_fill_for(slp_nat_ds)
-                            )
-                            _write_geotiff(
-                                out_dir / "slope_wide.tif", slp_wide, slp_nat_ds.crs, wtransform_nat
-                            )
+                pbar.update(1)
 
-                        if asp_nat_ds is not None:
-                            asp_wide = asp_nat_ds.read(
-                                1, window=win_nat, boundless=True, fill_value=_fill_for(asp_nat_ds)
-                            )
-                            _write_geotiff(
-                                out_dir / "aspect_wide.tif", asp_wide, asp_nat_ds.crs, wtransform_nat
-                            )
-
-                    pbar.update(1)
-
-            LOG.info("Saved %d patches for %s in %s", saved, name, patch_subdir)
+        LOG.info("Saved %d patches for %s in %s", saved, name, patch_subdir)
 
 
 # ======================================================================================

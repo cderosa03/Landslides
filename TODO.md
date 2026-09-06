@@ -5,38 +5,38 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 1. Contratto dei campioni e controlli iniziali
 
-- [x] Definire forme, dtype e significato di ogni tensore.
-- [x] Planet pre/post: richiedere esattamente forma `(3, H, W)`.
-- [x] Sentinel pre/post: richiedere forma `(N_TEMPORAL, 10, H, W)`.
-- [x] Maschera target: richiedere forma `(1, H, W)`.
-- [x] Maschere temporali Sentinel: richiedere forma `(N_TEMPORAL,)` e dtype booleano.
-- [x] AUX: definire forma, canali, unità di misura e normalizzazione esplicita
-      (attualmente unità sorgente, senza normalizzazione).
-- [x] Rifiutare tensori con NaN, Inf, numero di canali o dimensioni errati.
-- [x] Eliminare il fallback Sentinel fisso a `(10, 128, 128)`.
-- [x] Controllare che il DataLoader mantenga tutte le modalità previste.
-- [x] Aggiungere log iniziali con nomi e forme degli input ricevuti dal modello.
+- [X] Definire forme, dtype e significato di ogni tensore.
+- [X] Planet pre/post: richiedere esattamente forma `(3, H, W)`.
+- [X] Sentinel pre/post: richiedere forma `(N_TEMPORAL, 10, H, W)`.
+- [X] Maschera target: richiedere forma `(1, H, W)`.
+- [X] Maschere temporali Sentinel: richiedere forma `(N_TEMPORAL,)` e dtype booleano.
+- [X] AUX: definire forma, canali, unità di misura e normalizzazione esplicita
+  (attualmente unità sorgente, senza normalizzazione).
+- [X] Rifiutare tensori con NaN, Inf, numero di canali o dimensioni errati.
+- [X] Eliminare il fallback Sentinel fisso a `(10, 128, 128)`.
+- [X] Controllare che il DataLoader mantenga tutte le modalità previste.
+- [X] Aggiungere log iniziali con nomi e forme degli input ricevuti dal modello.
 
 ## 2. Augmentation geometrica sincronizzata — critico
 
-- [x] Centralizzare nel dataset multimodale la generazione dei parametri casuali.
-- [x] Estrarre una sola volta flip, rotazione ed eventuale crop per campione.
-- [x] Applicare gli stessi parametri a Planet pre/post.
-- [x] Applicare gli stessi parametri a tutti i frame Sentinel pre/post.
-- [x] Applicare gli stessi parametri alla mask.
-- [x] Applicare gli stessi parametri agli AUX spaziali.
-- [x] Separare e documentare le trasformazioni radiometriche specifiche dei sensori.
-- [x] Aggiungere un test sintetico con marker spaziali riconoscibili.
-- [x] Verificare nel test che tutte le modalità restino allineate dopo l'augmentation.
+- [X] Centralizzare nel dataset multimodale la generazione dei parametri casuali.
+- [X] Estrarre una sola volta flip, rotazione ed eventuale crop per campione.
+- [X] Applicare gli stessi parametri a Planet pre/post.
+- [X] Applicare gli stessi parametri a tutti i frame Sentinel pre/post.
+- [X] Applicare gli stessi parametri alla mask.
+- [X] Applicare gli stessi parametri agli AUX spaziali.
+- [X] Separare e documentare le trasformazioni radiometriche specifiche dei sensori.
+- [X] Aggiungere un test sintetico con marker spaziali riconoscibili.
+- [X] Verificare nel test che tutte le modalità restino allineate dopo l'augmentation.
 
 ## 3. Allineamento Planet pre/post — critico
 
-- [ ] Confrontare CRS, affine transform, bounds, risoluzione e dimensioni prima del patching.
-- [ ] Interrompere la generazione in caso di mismatch non corretto.
-- [ ] Riproiettare Planet post sulla griglia Planet pre quando necessario.
-- [ ] Riproiettare mask e raster ausiliari sulla griglia corretta quando necessario.
-- [ ] Non assegnare a dati non riproiettati la trasformazione della patch Planet pre.
-- [ ] Aggiungere test con raster aventi CRS o transform differenti.
+- [x] Confrontare CRS, affine transform, bounds, risoluzione e dimensioni prima del patching.
+- [x] Interrompere la generazione in caso di mismatch non corretto.
+- [x] Riproiettare Planet post sulla griglia Planet pre quando necessario.
+- [x] Riproiettare mask e raster ausiliari sulla griglia corretta quando necessario.
+- [x] Non assegnare a dati non riproiettati la trasformazione della patch Planet pre.
+- [x] Aggiungere test con raster aventi CRS o transform differenti.
 
 ## 4. Preprocessing Sentinel-2
 
