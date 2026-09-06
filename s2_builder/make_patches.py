@@ -1,3 +1,4 @@
+from collections import defaultdict
 import logging
 import numpy as np
 import os
@@ -18,9 +19,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "PlanetScope" / "patches"))
 S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
 S2_PRODUCT_LEVEL = "MSIL2A"
+MIN_VALID_COVERAGE = float(os.getenv("S2_MIN_VALID_COVERAGE", "0.95"))
 EVENTS = os.getenv(
     "S2_EVENTS", "Lombok2018,Philippines2019,Michoacan2022,EmiliaRomagna2023"
 ).split(",")
+
+if not 0.0 <= MIN_VALID_COVERAGE <= 1.0:
+    raise ValueError("S2_MIN_VALID_COVERAGE must be between 0 and 1")
 
 
 def get_crs_from_mgrs(tile_name: str):
@@ -60,7 +65,7 @@ def find_overlapping_s2_tiles(event: str, patch_ds: rasterio.io.DatasetReader) -
 
     overlapping_tiles = []
 
-    for tile_dir in s2_event_dir.iterdir():
+    for tile_dir in sorted(s2_event_dir.iterdir()):
         if not tile_dir.is_dir():
             continue
 
@@ -118,8 +123,8 @@ def get_all_s2_images_for_tile(tile_dir: Path) -> dict:
     return s2_images
 
 
-def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader) -> np.ndarray:
-    """Reproject a Sentinel-2 image onto the PlanetScope patch grid (spatially aligned)."""
+def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader):
+    """Project one Sentinel-2 raster and its valid-data mask onto a Planet patch."""
     try:
         with rasterio.open(s2_path) as src:
             if src.count == 0 or src.width == 0 or src.height == 0:
@@ -138,6 +143,7 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader) ->
 
             dst_shape = (src.count, patch_ds.height, patch_ds.width)
             dst = np.zeros(dst_shape, dtype=np.float32)
+            valid = np.zeros((patch_ds.height, patch_ds.width), dtype=np.uint8)
 
             reproject(
                 source=rasterio.band(src, list(range(1, src.count + 1))),
@@ -150,20 +156,76 @@ def reproject_s2_to_patch(s2_path: Path, patch_ds: rasterio.io.DatasetReader) ->
                 num_threads=2,
                 warp_mem_limit=512,
             )
+            reproject(
+                source=src.dataset_mask(),
+                destination=valid,
+                src_transform=src.transform,
+                src_crs=src_crs,
+                dst_transform=patch_ds.transform,
+                dst_crs=patch_ds.crs,
+                resampling=Resampling.nearest,
+                num_threads=2,
+                warp_mem_limit=512,
+            )
 
-        return dst
+        return dst, valid.astype(bool)
 
     except Exception as e:
         logging.warning(f"Skipping {s2_path}: {e}")
-        return None
+        return None, None
 
 
-def source_tags(s2_path: Path) -> dict:
-    with rasterio.open(s2_path) as source:
-        tags = {key: value for key, value in source.tags().items() if key.startswith("s2_")}
-    tags.setdefault("s2_level", S2_PRODUCT_LEVEL)
-    tags["s2_source_file"] = str(s2_path)
-    return tags
+def mosaic_s2_images(image_paths, patch_ds):
+    """Merge same-date tiles by taking the first valid pixel in sorted tile order."""
+    mosaic_10m = mosaic_20m = valid_10m = valid_20m = None
+
+    for image_paths_for_tile in image_paths:
+        data_10m, coverage_10m = reproject_s2_to_patch(
+            image_paths_for_tile["10m"], patch_ds
+        )
+        data_20m, coverage_20m = reproject_s2_to_patch(
+            image_paths_for_tile["20m"], patch_ds
+        )
+        if data_10m is None or data_20m is None:
+            continue
+
+        if mosaic_10m is None:
+            mosaic_10m = np.zeros_like(data_10m)
+            mosaic_20m = np.zeros_like(data_20m)
+            valid_10m = np.zeros_like(coverage_10m, dtype=bool)
+            valid_20m = np.zeros_like(coverage_20m, dtype=bool)
+
+        take_10m = coverage_10m & ~valid_10m
+        take_20m = coverage_20m & ~valid_20m
+        mosaic_10m[:, take_10m] = data_10m[:, take_10m]
+        mosaic_20m[:, take_20m] = data_20m[:, take_20m]
+        valid_10m |= coverage_10m
+        valid_20m |= coverage_20m
+
+    if mosaic_10m is None:
+        return None, None, None
+
+    valid = valid_10m & valid_20m
+    mosaic_10m[:, ~valid] = 0.0
+    mosaic_20m[:, ~valid] = 0.0
+    return mosaic_10m, mosaic_20m, valid
+
+
+def mosaic_metadata(date_str, image_paths):
+    tiles = []
+    products = []
+    for paths in image_paths:
+        with rasterio.open(paths["10m"]) as source:
+            tags = source.tags()
+        tiles.append(tags.get("s2_tile", paths["tile"]))
+        products.append(tags.get("s2_product", paths["10m"].parent.name))
+
+    return {
+        "s2_level": S2_PRODUCT_LEVEL,
+        "s2_acquisition_date": date_str,
+        "s2_source_tiles": ",".join(tiles),
+        "s2_source_products": ",".join(products),
+    }
 
 
 def write_patch(
@@ -188,6 +250,35 @@ def write_patch(
         dst.update_tags(**metadata)
 
 
+def write_coverage(
+    out_path: Path,
+    valid: np.ndarray,
+    ref_ds: rasterio.io.DatasetReader,
+    metadata: dict,
+):
+    meta = ref_ds.meta.copy()
+    meta.update({
+        "count": 1,
+        "height": valid.shape[0],
+        "width": valid.shape[1],
+        "dtype": "uint8",
+        "transform": ref_ds.transform,
+        "crs": ref_ds.crs,
+    })
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(valid.astype(np.uint8), 1)
+        dst.update_tags(**metadata)
+
+
+def group_images_by_date(tile_dirs):
+    """Group paired L2A rasters by date, preserving deterministic tile order."""
+    images_by_date = defaultdict(list)
+    for tile_dir in sorted(tile_dirs):
+        for date_str, paths in get_all_s2_images_for_tile(tile_dir).items():
+            images_by_date[date_str].append({"tile": tile_dir.name, **paths})
+    return dict(sorted(images_by_date.items()))
+
+
 def process_patch(patch_dir: Path, event: str):
     pre_path = patch_dir / "pre.tif"
     if not pre_path.exists():
@@ -202,30 +293,41 @@ def process_patch(patch_dir: Path, event: str):
             return
 
         s2_count = 0
-        for tile_dir in overlapping_tiles:
-            s2_images = get_all_s2_images_for_tile(tile_dir)
-            for date_str, paths in s2_images.items():
-                s2_10m_patch = reproject_s2_to_patch(paths["10m"], patch_ds)
-                s2_20m_patch = reproject_s2_to_patch(paths["20m"], patch_ds)
+        for date_str, image_paths in group_images_by_date(overlapping_tiles).items():
+            s2_10m_patch, s2_20m_patch, valid = mosaic_s2_images(
+                image_paths, patch_ds
+            )
+            if s2_10m_patch is None:
+                continue
 
-                if s2_10m_patch is None or s2_20m_patch is None:
-                    continue
+            coverage = float(valid.mean())
+            if coverage < MIN_VALID_COVERAGE:
+                logging.warning(
+                    "Skipping %s/%s on %s: valid coverage %.2f%% < %.2f%%",
+                    event,
+                    patch_dir.name,
+                    date_str,
+                    coverage * 100,
+                    MIN_VALID_COVERAGE * 100,
+                )
+                continue
 
-                date_dir = patch_dir / "s2" / date_str
-                write_patch(
-                    date_dir / "s2_10m.tif",
-                    s2_10m_patch,
-                    patch_ds,
-                    source_tags(paths["10m"]),
-                )
-                write_patch(
-                    date_dir / "s2_20m.tif",
-                    s2_20m_patch,
-                    patch_ds,
-                    source_tags(paths["20m"]),
-                )
-                s2_count += 1
-                logging.info(f"Saved Sentinel-2 patch for {date_str} ({tile_dir.name})")
+            date_dir = patch_dir / "s2" / date_str
+            date_dir.mkdir(parents=True, exist_ok=True)
+            metadata = {
+                **mosaic_metadata(date_str, image_paths),
+                "s2_valid_coverage": f"{coverage:.6f}",
+            }
+            write_patch(date_dir / "s2_10m.tif", s2_10m_patch, patch_ds, metadata)
+            write_patch(date_dir / "s2_20m.tif", s2_20m_patch, patch_ds, metadata)
+            write_coverage(date_dir / "s2_coverage.tif", valid, patch_ds, metadata)
+            s2_count += 1
+            logging.info(
+                "Saved Sentinel-2 mosaic for %s from tiles %s (coverage %.2f%%)",
+                date_str,
+                metadata["s2_source_tiles"],
+                coverage * 100,
+            )
 
         if s2_count == 0:
             logging.warning(f"No Sentinel-2 data extracted for patch {patch_dir.name}")

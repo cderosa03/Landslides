@@ -50,12 +50,12 @@ dopo aver implementato la modifica e aver eseguito il relativo controllo o test.
 
 ## 5. Gestione di più tile Sentinel — critico
 
-- [ ] Raccogliere tutti i tile che coprono la stessa patch e data.
-- [ ] Mosaicare i tile prima o durante la riproiezione.
-- [ ] Impedire che un tile sovrascriva il precedente.
-- [ ] Rendere deterministico l'ordinamento di tile, livelli e date.
-- [ ] Calcolare la percentuale di copertura valida di ogni patch.
-- [ ] Scartare o segnalare le patch senza copertura sufficiente.
+- [x] Raccogliere tutti i tile che coprono la stessa patch e data.
+- [x] Mosaicare i tile prima o durante la riproiezione.
+- [x] Impedire che un tile sovrascriva il precedente.
+- [x] Rendere deterministico l'ordinamento di tile, livelli e date.
+- [x] Calcolare la percentuale di copertura valida di ogni patch.
+- [x] Scartare o segnalare le patch senza copertura sufficiente.
 
 ## 6. NoData e nuvole Sentinel
 
