@@ -242,7 +242,25 @@ def validate(loader, model, criterion, th_metric="F1"):
     all_probs, all_masks = [], []
     running_loss, n_batches = 0.0, 0
 
+    batch_contract_checked = False
     for batch in tqdm(loader, desc="Validating", ncols=100):
+        if not batch_contract_checked:
+            loader.dataset.validate_batch(
+                batch, loader.dataset.s2_ds.n_temporal, "validation"
+            )
+            logger.info(
+                "Validation DataLoader modalities: %s; model inputs: %s",
+                {
+                    key: tuple(value.shape)
+                    for key, value in batch.items()
+                    if isinstance(value, torch.Tensor)
+                },
+                [
+                    "s2_pre", "s2_post", "planet_pre", "planet_post",
+                    "s2_valid_pre", "s2_valid_post",
+                ],
+            )
+            batch_contract_checked = True
         gt_mask = batch["mask"].to(device, non_blocking=True)
 
         logits = model(
@@ -324,9 +342,27 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
     for epoch in range(start_epoch, epochs):
         model.train()
         total_loss, total_samples = 0.0, 0
+        batch_contract_checked = False
 
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", ncols=100) as pbar:
             for batch in pbar:
+                if not batch_contract_checked:
+                    train_loader.dataset.validate_batch(
+                        batch, train_loader.dataset.s2_ds.n_temporal, "training"
+                    )
+                    logger.info(
+                        "Training DataLoader modalities: %s; model inputs: %s",
+                        {
+                            key: tuple(value.shape)
+                            for key, value in batch.items()
+                            if isinstance(value, torch.Tensor)
+                        },
+                        [
+                            "s2_pre", "s2_post", "planet_pre", "planet_post",
+                            "s2_valid_pre", "s2_valid_post",
+                        ],
+                    )
+                    batch_contract_checked = True
                 gt_mask = batch["mask"].to(device)
 
                 optimizer.zero_grad()
