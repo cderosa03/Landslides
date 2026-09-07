@@ -1,10 +1,9 @@
 import logging
+from collections import Counter
 import numpy as np
 import os
 import torch
 import rasterio
-import random
-import torchvision.transforms.functional as TF
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -65,12 +64,19 @@ class PSLandslideSentinel2Dataset(Dataset):
         apply_transform=False,
         normalize=True,
         n_temporal=N_TEMPORAL,
+        patch_ids=None,
     ):
+        if apply_transform:
+            raise ValueError(
+                "L'augmentation geometrica deve essere applicata da "
+                "MultiModalLandslideDataset per restare sincronizzata."
+            )
         self.root = Path(patches_root)
         self.events = list(events)
-        self.apply_transform = apply_transform
+        self.patch_ids = None if patch_ids is None else {str(value) for value in patch_ids}
         self.normalize = normalize
         self.n_temporal = n_temporal
+        self.excluded = Counter()
 
         self.samples = self._collect_samples()
 
@@ -86,21 +92,29 @@ class PSLandslideSentinel2Dataset(Dataset):
         for event in tqdm(self.events, desc="Lettura eventi S2"):
             cutoff = EVENT_CUTOFFS.get(event)
             if cutoff is None:
+                self.excluded["missing_event_cutoff"] += 1
                 print(f"[WARN] Nessun cutoff definito per '{event}', salto.")
                 continue
 
             event_dir = self.root / event
             if not event_dir.exists():
+                self.excluded["missing_event_directory"] += 1
                 continue
 
             patch_dirs = sorted(
-                [p for p in event_dir.iterdir() if p.is_dir() and p.name.isdigit()],
+                [
+                    p for p in event_dir.iterdir()
+                    if p.is_dir()
+                    and p.name.isdigit()
+                    and (self.patch_ids is None or p.name in self.patch_ids)
+                ],
                 key=lambda p: int(p.name),
             )
 
             for patch_dir in patch_dirs:
                 s2_dir = patch_dir / "s2"
                 if not s2_dir.exists():
+                    self.excluded["missing_s2_directory"] += 1
                     continue
 
                 # Raccogli tutte le date con entrambi i file
@@ -113,6 +127,7 @@ class PSLandslideSentinel2Dataset(Dataset):
                 ])
 
                 if not all_dates:
+                    self.excluded["no_complete_s2_dates"] += 1
                     continue
 
                 # Dividi in pre e post rispetto al cutoff
@@ -126,6 +141,7 @@ class PSLandslideSentinel2Dataset(Dataset):
                 # in entrambe le fasi. I frame oltre quelli disponibili
                 # vengono invece gestiti con padding in _build_stack().
                 if REQUIRE_BOTH_TEMPORAL_SIDES and (not pre_dates or not post_dates):
+                    self.excluded["incomplete_pre_post_temporal_pair"] += 1
                     logger.info(
                         "Skipping %s/%s: incomplete temporal pair within %s days "
                         "(pre=%s, post=%s)",
@@ -153,6 +169,8 @@ class PSLandslideSentinel2Dataset(Dataset):
                     "post_dates": post_dates,
                 })
 
+        if self.excluded:
+            logger.info("Sentinel samples excluded: %s", dict(self.excluded))
         return samples
 
     # ── Lettura ───────────────────────────────────────────────────────────
@@ -213,10 +231,6 @@ class PSLandslideSentinel2Dataset(Dataset):
             pre  = pre  / 10000.0
             post = post / 10000.0
 
-        # Data augmentation 
-        if self.apply_transform:
-            pre, post = self._transform(pre, post)
-
         return {
             "pre":        pre,         # (N_TEMPORAL, 10, H, W)
             "post":       post,        # (N_TEMPORAL, 10, H, W)
@@ -227,19 +241,3 @@ class PSLandslideSentinel2Dataset(Dataset):
         }
 
     # ── Augmentation ─────────────────────────────────────────────────────
-    def _transform(self, pre: torch.Tensor, post: torch.Tensor):
-        """
-        Flip orizzontale e rotazione casuale (0/90/180/270°) applicati
-        coerentemente su tutti i frame della serie temporale.
-        pre/post: (N, C, H, W)
-        """
-        if random.random() < 0.5:
-            pre  = torch.flip(pre,  dims=[-1])
-            post = torch.flip(post, dims=[-1])
-
-        k = random.randint(0, 3)
-        if k:
-            pre  = torch.rot90(pre,  k, dims=[-2, -1])
-            post = torch.rot90(post, k, dims=[-2, -1])
-
-        return pre, post

@@ -46,11 +46,18 @@ class AuxIntegrationTests(unittest.TestCase):
         planet = torch.randn(1, 3, 32, 32)
         aux = torch.zeros(1, 4, 32, 32)
 
-        output_without_aux = model(s2, s2, planet, planet, aux)
-        output_with_aux = model(s2, s2, planet, planet, aux + 0.5)
+        output_without_aux = model(s2, s2 + 0.1, planet, planet + 0.1, aux)
+        output_with_aux = model(s2, s2 + 0.1, planet, planet + 0.1, aux + 0.5)
         self.assertFalse(torch.allclose(output_without_aux, output_with_aux))
 
         output_with_aux.mean().backward()
         gradient = model.aux_encoder.stem[0].weight.grad
         self.assertIsNotNone(gradient)
         self.assertTrue(torch.count_nonzero(gradient).item() > 0)
+        for encoder in (model.s2_encoder, model.planet_encoder):
+            self.assertTrue(
+                any(
+                    parameter.grad is not None and torch.count_nonzero(parameter.grad).item()
+                    for parameter in encoder.parameters()
+                )
+            )

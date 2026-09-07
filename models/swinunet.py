@@ -1,10 +1,7 @@
-import logging
-import numpy as np
 import timm
 import torch
 import torch.nn as nn
-
-from einops import rearrange
+import torch.nn.functional as F
 
 
 # ── Lookup modelli Swin V2 ────────────────────────────────────────────────
@@ -45,34 +42,6 @@ class DiffFusionModule(nn.Module):
         return self.relu(self.fusion(x))
 
 
-class PatchExpand(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.expand = nn.Linear(dim, 4 * dim, bias=False)
-        self.norm   = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        B, L, C = x.shape
-        x = self.expand(x)
-        x = x.view(B, L, 4, C)
-        x = rearrange(x, 'b l p c -> b (l p) c')
-        return self.norm(x)
-
-
-class FinalPatchExpand_X4(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.expand = nn.Linear(dim, 16 * dim, bias=False)
-        self.norm   = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        B, L, C = x.shape
-        x = self.expand(x)
-        x = x.view(B, L, 16, C)
-        x = rearrange(x, 'b l p c -> b (l p) c')
-        return self.norm(x)
-
-
 class BasicLayer_up(nn.Module):
     """Uno stage del decoder Transformer."""
     def __init__(self, dim, depth, num_heads):
@@ -98,7 +67,6 @@ class TransformerDecoder(nn.Module):
     def __init__(
         self,
         img_size=128,
-        patch_size=4,
         enc_channels=(96, 192, 384, 768),
         depths_decoder=(2, 2, 2, 2),
         num_heads=(3, 6, 12, 24),
@@ -125,32 +93,38 @@ class TransformerDecoder(nn.Module):
                 self.concat_back_dim.append(nn.Identity())
 
         self.norm_up = nn.LayerNorm(enc_channels[0])
-        self.up      = FinalPatchExpand_X4(enc_channels[0])
         self.output  = nn.Conv2d(enc_channels[0], num_classes, kernel_size=1)
 
         self.img_size   = img_size
-        self.patch_size = patch_size
 
     def forward(self, x):
-        x = [xi.flatten(2).transpose(1, 2) for xi in x]
         x, skips = x[-1], x[:-1]
 
         for i in range(self.num_layers):
-            x = self.layers_up[i](x)
+            batch, channels, height, width = x.shape
+            tokens = x.flatten(2).transpose(1, 2)
+            x = self.layers_up[i](tokens).transpose(1, 2).reshape(
+                batch, channels, height, width
+            )
             if i < len(skips):
                 skip = skips[-(i + 1)]
-                if skip.shape[1] != x.shape[1]:
-                    scale = skip.shape[1] // x.shape[1]
-                    x = x.repeat_interleave(scale, dim=1)
-                x = torch.cat([x, skip], dim=-1)
-                x = self.concat_back_dim[i](x)
+                x = F.interpolate(
+                    x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+                )
+                x = torch.cat([x, skip], dim=1)
+                batch, channels, height, width = x.shape
+                x = self.concat_back_dim[i](x.flatten(2).transpose(1, 2))
+                x = x.transpose(1, 2).reshape(batch, -1, height, width)
 
-        x = self.norm_up(x)
-        x = self.up(x)
-
-        B, L, C = x.shape
-        H = W = int(np.sqrt(L))
-        x = x.view(B, H, W, C).permute(0, 3, 1, 2)
+        batch, channels, height, width = x.shape
+        x = self.norm_up(x.flatten(2).transpose(1, 2))
+        x = x.transpose(1, 2).reshape(batch, channels, height, width)
+        x = F.interpolate(
+            x,
+            size=(self.img_size, self.img_size),
+            mode="bilinear",
+            align_corners=False,
+        )
         return self.output(x)
 
 
@@ -173,7 +147,17 @@ class SwinEncoder(nn.Module):
 
     def forward(self, x):
         feats = self.model(x)
-        return [f.permute(0, 3, 1, 2) for f in feats]
+        output = []
+        for feature, channels in zip(feats, self.out_channels):
+            if feature.shape[1] == channels:  # timm already returned NCHW
+                output.append(feature)
+            elif feature.shape[-1] == channels:  # Swin native NHWC
+                output.append(feature.permute(0, 3, 1, 2))
+            else:
+                raise ValueError(
+                    f"Unexpected Swin feature shape {tuple(feature.shape)} for {channels} channels"
+                )
+        return output
 
 
 class AuxPyramidEncoder(nn.Module):
@@ -230,7 +214,8 @@ class ChangeDetectionSwinUNet(nn.Module):
     """
 
     def __init__(
-        self, img_size=128, num_classes=1, model_size="small", aux_channels=4
+        self, img_size=128, num_classes=1, model_size="small", aux_channels=4,
+        pretrained=True,
     ):
         super().__init__()
         self.img_size = img_size
@@ -245,11 +230,11 @@ class ChangeDetectionSwinUNet(nn.Module):
         # ── Encoder separati per i due sensori ───────────────────────────
         self.s2_encoder = SwinEncoder(
             model_name=model_name, img_size=img_size,
-            in_chans=3, pretrained=True, out_indices=out_indices,
+            in_chans=3, pretrained=pretrained, out_indices=out_indices,
         )
         self.planet_encoder = SwinEncoder(
             model_name=model_name, img_size=img_size,
-            in_chans=3, pretrained=True, out_indices=out_indices,
+            in_chans=3, pretrained=pretrained, out_indices=out_indices,
         )
 
         enc_channels = self.s2_encoder.out_channels  # [96, 192, 384, 768]

@@ -46,13 +46,6 @@ DESCRIPTIONS_20m = [
     "Band 12 - SWIR"
 ]
 
-annotations = {}
-
-for gpkg_path in ANNOTATIONS_PATH.glob("*.gpkg"):
-    inventory_name = gpkg_path.stem
-    annotations[inventory_name] = gpkg_path
-
-
 def transform_bounds(raster_crs, raster_bounds, target_crs="EPSG:4326"):
     """Transform bounds from raster CRS to target CRS."""
     transformer = Transformer.from_crs(raster_crs, target_crs, always_xy=True)

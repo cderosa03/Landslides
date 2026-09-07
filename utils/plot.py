@@ -17,9 +17,8 @@ def plot_pr_curve(pr_data, best_idx, save_path=None, auprc=None):
     recall    = np.asarray(pr_data["recall"])
     thresholds = np.asarray(pr_data["thresholds"])
 
-    # Build a threshold vector aligned to precision/recall (N+1)
-    # [0.0] + thresholds + [1.0]
-    thr_aligned = np.concatenate(([0.0], thresholds, [1.0]))
+    if not 0 <= best_idx < len(thresholds):
+        raise ValueError("best_idx must reference a PR point with a real threshold")
 
     # AUPRC if not provided
     if auprc is None:
@@ -36,7 +35,7 @@ def plot_pr_curve(pr_data, best_idx, save_path=None, auprc=None):
 
     # Mark best operating point
     bx, by = recall[best_idx], precision[best_idx]
-    bthr = thr_aligned[best_idx]
+    bthr = thresholds[best_idx]
     plt.scatter([bx], [by], s=60)
     plt.annotate(f"best @ τ={bthr:.3f}\nP={by:.3f}, R={bx:.3f}",
                  (bx, by), textcoords="offset points", xytext=(8, -18))
