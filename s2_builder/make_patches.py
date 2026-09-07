@@ -20,7 +20,6 @@ PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "PlanetScope" / "patc
 S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
 S2_PRODUCT_LEVEL = "MSIL2A"
 MIN_VALID_COVERAGE = float(os.getenv("S2_MIN_VALID_COVERAGE", "0.95"))
-MAX_INVALID_FRACTION = float(os.getenv("S2_MAX_INVALID_FRACTION", "0.20"))
 INVALID_SCL_CLASSES = frozenset(
     int(value)
     for value in os.getenv("S2_INVALID_SCL_CLASSES", "0,1,3,8,9,10").split(",")
@@ -32,8 +31,6 @@ EVENTS = os.getenv(
 
 if not 0.0 <= MIN_VALID_COVERAGE <= 1.0:
     raise ValueError("S2_MIN_VALID_COVERAGE must be between 0 and 1")
-if not 0.0 <= MAX_INVALID_FRACTION <= 1.0:
-    raise ValueError("S2_MAX_INVALID_FRACTION must be between 0 and 1")
 
 
 def get_crs_from_mgrs(tile_name: str):
@@ -362,10 +359,7 @@ def process_patch(patch_dir: Path, event: str):
 
             coverage = float(valid.mean())
             invalid_fraction = 1.0 - coverage
-            if (
-                coverage < MIN_VALID_COVERAGE
-                or invalid_fraction > MAX_INVALID_FRACTION
-            ):
+            if coverage < MIN_VALID_COVERAGE:
                 logging.warning(
                     "Skipping %s/%s on %s: valid %.2f%%, invalid %.2f%%",
                     event,

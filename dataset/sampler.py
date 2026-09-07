@@ -1,5 +1,7 @@
 import pickle
+import json
 from collections import defaultdict
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -12,12 +14,23 @@ class CachedSamplerBase(Sampler):
         cache_dir = Path("dataset/cache")
         cache_dir.mkdir(exist_ok=True, parents=True)
 
-        # cache file paths
-        self.pos_file = cache_dir / f"{cache_prefix}_pos_{patch_size}.npy"
-        self.neg_file = cache_dir / f"{cache_prefix}_neg_{patch_size}.npy"
-        self.map_file = cache_dir / f"{cache_prefix}_event_map_{patch_size}.pkl"
-
         self.dataset = dataset
+        planet = getattr(dataset, "planet_ds", None)
+        self.cache_config = {
+            "prefix": cache_prefix,
+            "patch_size": patch_size,
+            "samples": [
+                (entry["event"], entry["patch_id"])
+                for entry in getattr(dataset, "aligned_indices", [])
+            ],
+            "planet_root": str(getattr(planet, "patches_dir", "")),
+        }
+        cache_key = sha256(
+            json.dumps(self.cache_config, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        self.pos_file = cache_dir / f"{cache_prefix}_{cache_key}_pos.npy"
+        self.neg_file = cache_dir / f"{cache_prefix}_{cache_key}_neg.npy"
+        self.map_file = cache_dir / f"{cache_prefix}_{cache_key}_event_map.pkl"
 
         # load or build positive/negative sample indices
         if self.pos_file.exists() and self.neg_file.exists():
@@ -129,7 +142,7 @@ class FixedBalancedSampler(CachedSamplerBase):
         super().__init__(dataset, patch_size, cache_prefix="val")
 
         # fixed validation negatives (balanced)
-        self.fixed_file = Path("dataset/cache") / f"val_fixed_neg_{patch_size}.npy"
+        self.fixed_file = Path("dataset/cache") / f"val_fixed_neg_{self.pos_file.stem}.npy"
         if self.fixed_file.exists():
             fixed_neg = np.load(self.fixed_file)
         else:

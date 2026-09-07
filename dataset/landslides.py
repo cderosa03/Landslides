@@ -1,12 +1,10 @@
 import json
+from collections import Counter
+from hashlib import sha256
 import numpy as np
-import random
 import rasterio
 import torch
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 
-from shapely.geometry import box
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -14,40 +12,62 @@ from tqdm import tqdm
 
 PRE_FILENAME = "pre.tif"
 POST_FILENAME = "post.tif"
-DTM_FILENAME = "dem_wide.tif"
-SLOPE_FILENAME = "slope_wide.tif"
-ASPECT_FILENAME = "aspect_wide.tif"
+DTM_FILENAME = "dem.tif"
+SLOPE_FILENAME = "slope.tif"
+ASPECT_FILENAME = "aspect.tif"
 MASK_FILENAME = "mask.tif"
 
-# AUX use their native-grid wide context: the same array dimensions as Planet,
-# but a larger geographic footprint centred on the Planet patch.
+# AUX use rasters aligned to the Planet patch grid.
 AUX_CHANNELS = ("dem_asinh", "slope_unit", "aspect_sin", "aspect_cos")
 AUX_UNITS = ("normalized", "normalized", "unitless", "unitless")
 AUX_NORMALIZATION = "asinh(dem_metres / 1000), slope_degrees / 90, sin/cos(aspect)"
 
 
 class PSLandslideDataset(Dataset):
-    def __init__(self, patches_dir, events, patch_size, apply_transform=False, use_post_only=False):
+    def __init__(
+        self,
+        patches_dir,
+        events,
+        patch_size,
+        apply_transform=False,
+        use_post_only=False,
+        patch_ids=None,
+    ):
+        if apply_transform:
+            raise ValueError(
+                "L'augmentation geometrica deve essere applicata da "
+                "MultiModalLandslideDataset per restare sincronizzata."
+            )
         self.patches_dir = Path(patches_dir)  # Ensure it's a Path object
-        self.apply_transform = apply_transform
         self.patch_size = patch_size
         # keep a concrete list so we can iterate multiple times
         self.events = list(events)
+        self.patch_ids = None if patch_ids is None else {str(value) for value in patch_ids}
         self.use_post_only = use_post_only
+        self.excluded = Counter()
+        self.duplicate_ids = []
 
         cache_dir = Path("dataset/cache")
         cache_dir.mkdir(exist_ok=True, parents=True)
 
-        events_tag = "_".join(sorted(events))
-        self.cache_index_path = cache_dir / f"ps_index_{events_tag}.json"
+        self.cache_config = {
+            "root": str(self.patches_dir.resolve()),
+            "events": sorted(self.events),
+            "patch_size": self.patch_size,
+            "use_post_only": self.use_post_only,
+            "patch_ids": None if self.patch_ids is None else sorted(self.patch_ids),
+            "aux_channels": AUX_CHANNELS,
+            "aux_grid": "planet_aligned",
+        }
+        cache_key = sha256(
+            json.dumps(self.cache_config, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        self.cache_index_path = cache_dir / f"ps_index_{cache_key}.json"
 
         if self.cache_index_path.exists():
             # load and validate against requested events
             folders = self._load_folders_cache()
-            cached_events = sorted({f["event"] for f in folders})
-            requested_events = sorted(set(self.events))
-
-            if cached_events == requested_events:
+            if folders is not None:
                 # cache is valid
                 self.folders = folders
             else:
@@ -59,8 +79,12 @@ class PSLandslideDataset(Dataset):
             self.folders = self._read_folders(self.events)
             self._save_folders_cache()
 
+        if self.excluded:
+            print(f"PlanetScope samples excluded: {dict(self.excluded)}")
+
     def _read_folders(self, events):
         folders = []
+        seen = set()
         # Iterate over events with progress bar
         for event in tqdm(events, desc="Reading events"):
             event_dir = self.patches_dir / event
@@ -68,7 +92,10 @@ class PSLandslideDataset(Dataset):
             if not event_dir.exists():
                 continue  # Skip missing event directories
 
-            patch_folders = sorted([p for p in event_dir.iterdir() if p.is_dir()])
+            patch_folders = sorted(
+                p for p in event_dir.iterdir()
+                if p.is_dir() and (self.patch_ids is None or p.name in self.patch_ids)
+            )
 
             # Iterate over patch folders with nested progress bar
             for patch_folder in tqdm(
@@ -84,8 +111,16 @@ class PSLandslideDataset(Dataset):
                 mask_path = patch_folder / MASK_FILENAME
 
                 # Ensure all necessary files exist before adding
-                if all(p.exists() for p in [pre_path, post_path, dtm_path,
-                                            slope_path, aspect_path, mask_path]):
+                paths = [pre_path, post_path, dtm_path, slope_path, aspect_path, mask_path]
+                missing = [path.name for path in paths if not path.exists()]
+                sample_id = (event, patch_folder.name)
+                if missing:
+                    self.excluded[f"missing:{','.join(missing)}"] += 1
+                elif sample_id in seen:
+                    self.duplicate_ids.append(sample_id)
+                    self.excluded["duplicate_event_patch"] += 1
+                else:
+                    seen.add(sample_id)
                     folders.append({
                         "event": event,
                         "patch_id": patch_folder.name,
@@ -115,12 +150,15 @@ class PSLandslideDataset(Dataset):
                 "mask": str(item["mask"]),
             })
         with open(self.cache_index_path, "w") as f:
-            json.dump(serializable, f)
+            json.dump({"config": self.cache_config, "folders": serializable}, f)
 
     def _load_folders_cache(self):
         """Load folder index from JSON cache."""
         with open(self.cache_index_path, "r") as f:
-            data = json.load(f)
+            payload = json.load(f)
+        if not isinstance(payload, dict) or payload.get("config") != self.cache_config:
+            return None
+        data = payload.get("folders", [])
         folders = []
         for item in data:
             # Extract patch_id from path if not in cache (backward compatibility)
@@ -137,6 +175,9 @@ class PSLandslideDataset(Dataset):
                 "aspect": Path(item["aspect"]),
                 "mask": Path(item["mask"]),
             })
+        required = ("pre", "post", "dtm", "slope", "aspect", "mask")
+        if any(not folder[name].exists() for folder in folders for name in required):
+            return None
         return folders
 
     def __len__(self):
@@ -180,9 +221,6 @@ class PSLandslideDataset(Dataset):
             dim=0,
         )
 
-        if self.apply_transform:
-            pre, post, aux, mask = self.transform(pre, post, aux, mask)
-
         return {
             "pre": pre,
             "post": post,
@@ -191,41 +229,6 @@ class PSLandslideDataset(Dataset):
             "event": sample_paths["event"],
             "patch_id": sample_paths["patch_id"],
         }
-
-    def transform(
-        self,
-        pre: torch.Tensor,
-        post: torch.Tensor,
-        aux: torch.Tensor,
-        mask: torch.Tensor,
-        crop_size=None
-    ) -> tuple:
-
-        # Horizontal flip
-        if random.random() < 0.5:
-            pre = TF.hflip(pre)
-            post = TF.hflip(post)
-            aux = TF.hflip(aux)
-            mask = TF.hflip(mask)
-
-        # Random rotation (0, 90, 180, 270 degrees)
-        k = random.randint(0, 3)
-        if k:
-            dims = (1, 2)  # H, W
-            pre = torch.rot90(pre, k, dims)
-            post = torch.rot90(post, k, dims)
-            aux = torch.rot90(aux, k, dims)
-            mask = torch.rot90(mask, k, dims)
-
-        # Optional: random crop
-        if crop_size:
-            i, j, h, w = TF.RandomCrop.get_params(pre, output_size=crop_size)
-            pre = TF.crop(pre, i, j, h, w)
-            post = TF.crop(post, i, j, h, w)
-            aux = TF.crop(aux, i, j, h, w)
-            mask = TF.crop(mask, i, j, h, w)
-
-        return pre, post, aux, mask
 
     def _read_tensor(self, file_path: Path) -> torch.Tensor:
         """Reads a raster file and converts it to a PyTorch tensor."""

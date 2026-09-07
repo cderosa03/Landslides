@@ -4,11 +4,11 @@ PlanetScope landslide dataset builder (PEP 8 compliant).
 
 Key features:
 - Windowed, memory-safe patch generation (no giant view_as_windows tensors).
-- Optional skipping of negative patches (default: skip).
+- Optional skipping of negative patches (disabled by default).
 - Threaded quad downloads with resilient pagination and retries.
 - Robust alpha-band handling for PlanetScope pre/post rasters.
 - CLI configurability (patch size, stride, cloud threshold, workers, etc.).
-- Native-grid "wide context" exports per patch: dem_wide, slope_wide, aspect_wide.
+- DEM, slope and aspect aligned directly to the PlanetScope grid.
 """
 
 from __future__ import annotations
@@ -17,9 +17,7 @@ import argparse
 import contextlib
 import json
 import logging
-import math
 import os
-import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -38,7 +36,6 @@ from rasterio.transform import Affine
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import (
     Resampling,
-    calculate_default_transform,
     reproject,
     transform_bounds,
 )
@@ -57,8 +54,6 @@ BASE_DIR = Path(
         "/home/jovyan/nfs/tesista3/landslide-detection/Landslides/PlanetScope",
     )
 )
-IMAGES_DIR = BASE_DIR / "images"
-PATCHES_DIR = BASE_DIR / "patches"
 ANNOTATIONS_PATH = Path("./inventories")
 KEY_PATH = Path("api_key.json")
 API_URL = "https://api.planet.com/basemaps/v1/mosaics"
@@ -391,7 +386,7 @@ def merge_quads(folder: Path, tag: str) -> None:
 
 
 # ======================================================================================
-# DEM + derivatives (aligned + native)
+# DEM + derivatives aligned to PlanetScope
 # ======================================================================================
 
 
@@ -406,7 +401,7 @@ def bounds_in_epsg4326(tif_path: Path) -> Tuple[float, ...]:
 
 
 def download_dem(inv: Inventory, base_dir: Path) -> None:
-    """Download DEM and emit both aligned-grid and native-grid versions."""
+    """Download the DEM and align it directly to the PlanetScope grid."""
 
     name = inv.name
     folder = base_dir / name
@@ -417,9 +412,8 @@ def download_dem(inv: Inventory, base_dir: Path) -> None:
         return
 
     dem_aligned = folder / "dem.tif"
-    dem_native = folder / "dem_native.tif"
-    if dem_aligned.exists() and dem_native.exists():
-        LOG.info("DEM (aligned + native) already exist for %s, skipping.", name)
+    if dem_aligned.exists():
+        LOG.info("Aligned DEM already exists for %s, skipping.", name)
         return
 
     LOG.info("Downloading DEM for %s...", name)
@@ -436,38 +430,7 @@ def download_dem(inv: Inventory, base_dir: Path) -> None:
         ref_transform = ref.transform
         ref_width, ref_height = ref.width, ref.height
 
-    # 1) Write dem_native.tif (CRS matched, native grid)
-    with rasterio.open(raw_path) as src:
-        transform_native, w_native, h_native = calculate_default_transform(
-            src.crs, target_crs, src.width, src.height, *src.bounds
-        )
-        meta_native = src.meta.copy()
-        meta_native.update(
-            crs=target_crs,
-            transform=transform_native,
-            width=w_native,
-            height=h_native,
-            driver="GTiff",
-            compress=COMPRESS,
-            tiled=True,
-            blockxsize=TILE_BLOCK,
-            blockysize=TILE_BLOCK,
-            BIGTIFF=BIGTIFF,
-        )
-        tmp_native = dem_native.with_suffix(".tif.part")
-        with rasterio.open(tmp_native, "w", **meta_native) as dst:
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=rasterio.band(dst, 1),
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=transform_native,
-                dst_crs=target_crs,
-                resampling=Resampling.bilinear,
-            )
-        tmp_native.replace(dem_native)
-
-    # 2) Write dem.tif aligned to pre_merged.tif grid
+    # Write dem.tif on exactly the same grid as pre_merged.tif.
     with rasterio.open(raw_path) as src:
         meta_aligned = src.meta.copy()
         meta_aligned.update(
@@ -496,40 +459,27 @@ def download_dem(inv: Inventory, base_dir: Path) -> None:
         tmp_aligned.replace(dem_aligned)
 
     raw_path.unlink(missing_ok=True)
-    LOG.info("DEM saved: %s (aligned), %s (native)", dem_aligned.name, dem_native.name)
+    LOG.info("Aligned DEM saved: %s", dem_aligned.name)
 
 
 def build_slope_aspect(inv: Inventory, base_dir: Path) -> None:
-    """Compute slope/aspect for aligned and native DEMs using GDAL."""
+    """Compute slope/aspect from the Planet-aligned DEM using GDAL."""
 
     name = inv.name
     folder = base_dir / name
 
     dem_aligned = folder / "dem.tif"
-    dem_native = folder / "dem_native.tif"
-
-    if not dem_aligned.exists() or not dem_native.exists():
-        LOG.warning("DEM files missing for %s; cannot compute slope/aspect.", name)
+    if not dem_aligned.exists():
+        LOG.warning("Aligned DEM missing for %s; cannot compute slope/aspect.", name)
         return
 
-    outputs = [
-        (dem_aligned, folder / "slope.tif", folder / "aspect.tif"),
-        (dem_native, folder / "slope_native.tif", folder / "aspect_native.tif"),
-    ]
-
-    for dem_path, slope_path, aspect_path in outputs:
-        if slope_path.exists() and aspect_path.exists():
-            continue
-
-        LOG.info(
-            "Computing slope/aspect for %s -> %s / %s",
-            dem_path.name,
-            slope_path.name,
-            aspect_path.name,
-        )
+    slope_path = folder / "slope.tif"
+    aspect_path = folder / "aspect.tif"
+    if not (slope_path.exists() and aspect_path.exists()):
+        LOG.info("Computing slope/aspect for %s", dem_aligned.name)
         gdal.DEMProcessing(
             str(slope_path),
-            str(dem_path),
+            str(dem_aligned),
             "slope",
             format="GTiff",
             slopeFormat="degree",
@@ -537,7 +487,7 @@ def build_slope_aspect(inv: Inventory, base_dir: Path) -> None:
         )
         gdal.DEMProcessing(
             str(aspect_path),
-            str(dem_path),
+            str(dem_aligned),
             "aspect",
             format="GTiff",
             computeEdges=True,
@@ -743,14 +693,6 @@ def aligned_sources(files):
             "slope": optional("slope", Resampling.bilinear),
             "aspect": optional("aspect", Resampling.bilinear),
         }
-        for key in ("dem_native", "slope_native", "aspect_native"):
-            if files[key].exists():
-                source = stack.enter_context(rasterio.open(files[key]))
-                if source.crs != pre.crs:
-                    raise ValueError(f"{key} CRS diverso dalla griglia Planet pre")
-                sources[key] = source
-            else:
-                sources[key] = None
         yield sources
 
 
@@ -844,33 +786,6 @@ def _write_window_from_src(
     tmp.replace(out_path)
 
 
-def _center_native_window(
-    ref_transform: Affine,
-    i_idx: int,
-    j_idx: int,
-    patch_size: Tuple[int, int],
-    stride: Tuple[int, int],
-    nat_ds: rasterio.io.DatasetReader,
-) -> Tuple[Window, Affine]:
-    """Compute a native-grid window centered at the Planet patch center."""
-
-    ph, pw = patch_size
-    sy, sx = stride
-
-    row = i_idx * sy + ph // 2
-    col = j_idx * sx + pw // 2
-
-    cx, cy = ref_transform * (col + 0.5, row + 0.5)
-
-    n_row, n_col = nat_ds.index(cx, cy)
-    r0 = int(n_row - ph // 2)
-    c0 = int(n_col - pw // 2)
-
-    win = Window(col_off=c0, row_off=r0, width=pw, height=ph)
-    wtransform = rasterio.windows.transform(win, nat_ds.transform)
-    return win, wtransform
-
-
 def generate_patches(
     inv: Inventory,
     base_dir: Path,
@@ -881,7 +796,7 @@ def generate_patches(
     cloud_skip_threshold: float = 0.0,
     skip_negatives: bool = False,
 ) -> None:
-    """Generate per-patch rasters and native-grid wide-context rasters."""
+    """Generate mutually aligned per-patch rasters."""
 
     name = inv.name
     folder = base_dir / name
@@ -901,10 +816,6 @@ def generate_patches(
         "area": folder / "area_mask.tif",
         "slope": folder / "slope.tif",
         "aspect": folder / "aspect.tif",
-        # Native-grid context
-        "dem_native": folder / "dem_native.tif",
-        "slope_native": folder / "slope_native.tif",
-        "aspect_native": folder / "aspect_native.tif",
     }
 
     missing_required = [k for k in ["pre", "post", "mask", "dem"] if not files[k].exists()]
@@ -926,10 +837,6 @@ def generate_patches(
         area_ds = sources["area"]
         slope_ds = sources["slope"]
         aspect_ds = sources["aspect"]
-        dem_nat_ds = sources["dem_native"]
-        slp_nat_ds = sources["slope_native"]
-        asp_nat_ds = sources["aspect_native"]
-
         height, width = pre_ds.shape
         n_rows, n_cols = grid_from_shape(height, width, patch_size, stride)
         total_patches = n_rows * n_cols
@@ -990,36 +897,6 @@ def generate_patches(
                     _write_window_from_src(
                         aspect_ds, out_dir / "aspect.tif", window, patch_transform
                     )
-
-                if dem_nat_ds is not None:
-                    win_nat, wtransform_nat = _center_native_window(
-                        pre_ds.transform, i_idx, j_idx, patch_size, stride, dem_nat_ds
-                    )
-
-                    def _fill_for(ds: rasterio.io.DatasetReader):
-                        is_float = np.issubdtype(np.dtype(ds.dtypes[0]), np.floating)
-                        return ds.nodata if ds.nodata is not None else (np.nan if is_float else 0)
-
-                    dem_wide = dem_nat_ds.read(
-                        1, window=win_nat, boundless=True, fill_value=_fill_for(dem_nat_ds)
-                    )
-                    _write_geotiff(
-                        out_dir / "dem_wide.tif", dem_wide, dem_nat_ds.crs, wtransform_nat
-                    )
-                    if slp_nat_ds is not None:
-                        slp_wide = slp_nat_ds.read(
-                            1, window=win_nat, boundless=True, fill_value=_fill_for(slp_nat_ds)
-                        )
-                        _write_geotiff(
-                            out_dir / "slope_wide.tif", slp_wide, slp_nat_ds.crs, wtransform_nat
-                        )
-                    if asp_nat_ds is not None:
-                        asp_wide = asp_nat_ds.read(
-                            1, window=win_nat, boundless=True, fill_value=_fill_for(asp_nat_ds)
-                        )
-                        _write_geotiff(
-                            out_dir / "aspect_wide.tif", asp_wide, asp_nat_ds.crs, wtransform_nat
-                        )
 
                 pbar.update(1)
 

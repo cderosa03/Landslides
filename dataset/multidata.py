@@ -61,12 +61,25 @@ class MultiModalLandslideDataset(Dataset):
                 "l'augmentation è centralizzata nel dataset multimodale."
             )
 
-        planet_indices = {
-            (entry["event"], entry["patch_id"]): index
-            for index, entry in enumerate(
-                tqdm(planet_ds.folders, desc="Indicizzazione PlanetScope")
+        planet_indices = {}
+        planet_duplicates = []
+        for index, entry in enumerate(tqdm(planet_ds.folders, desc="Indicizzazione PlanetScope")):
+            key = (entry["event"], entry["patch_id"])
+            if key in planet_indices:
+                planet_duplicates.append(key)
+            else:
+                planet_indices[key] = index
+        s2_duplicates = []
+        seen_s2 = set()
+        for entry in s2_ds.samples:
+            key = (entry["event"], entry["patch_id"])
+            if key in seen_s2:
+                s2_duplicates.append(key)
+            seen_s2.add(key)
+        if planet_duplicates or s2_duplicates:
+            raise ValueError(
+                f"Duplicati (event, patch_id): Planet={planet_duplicates}, S2={s2_duplicates}"
             )
-        }
         self.aligned_indices = [
             {
                 "planet_idx": planet_indices[(entry["event"], entry["patch_id"])],
@@ -79,7 +92,14 @@ class MultiModalLandslideDataset(Dataset):
             )
             if (entry["event"], entry["patch_id"]) in planet_indices
         ]
-        print(f"MultiModal dataset pronto: {len(self.aligned_indices)} patch allineate")
+        self.alignment_stats = {
+            "planet": len(planet_indices),
+            "sentinel": len(s2_ds.samples),
+            "aligned": len(self.aligned_indices),
+            "planet_without_sentinel": len(set(planet_indices) - seen_s2),
+            "sentinel_without_planet": len(seen_s2 - set(planet_indices)),
+        }
+        print(f"MultiModal dataset: {self.alignment_stats}")
 
     def __len__(self):
         return len(self.aligned_indices)

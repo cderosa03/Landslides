@@ -1,9 +1,9 @@
 import argparse
 import csv
+import json
 import logging
 import numpy as np
 import os
-import pandas as pd
 import random
 import torch
 import torch.optim as optim
@@ -15,7 +15,6 @@ from dataset.contracts import validate_multimodal_batch
 from dataset.multidata import MultiModalLandslideDataset
 from dataset.sampler import BalancedPosNegSampler
 
-from datetime import datetime
 from pathlib import Path
 from torch.nn import BCEWithLogitsLoss
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -33,6 +32,19 @@ from utils.plot import plot_pr_curve
 
 # ------------------------ SEED -------------------------
 SEED = 42
+PATIENCE = 20
+MODEL_SELECTION_METRIC = "AUPRC"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("TrainLogger")
+
+# Runtime state is initialized only by main(), so importing validation helpers
+# does not parse CLI arguments, scan datasets, create experiments or build a model.
+EXPERIMENT_DIR = None
+RUN_CONFIG = None
+writer = None
+device = None
+START_EARLY_STOPPING_FROM_EPOCH = 0
 
 
 def set_seed(seed: int) -> None:
@@ -44,9 +56,6 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-set_seed(SEED)
-
-
 # -------------------- DataLoader---------------------
 def seed_worker(worker_id: int) -> None:
     worker_seed = SEED + worker_id
@@ -55,160 +64,43 @@ def seed_worker(worker_id: int) -> None:
     torch.manual_seed(worker_seed)
 
 
-g = torch.Generator()
-g.manual_seed(SEED)
-
-
-# -------------------- ARGS---------------------
-parser = argparse.ArgumentParser()
-
-parser.add_argument("--description", type=str, required=True)
-parser.add_argument("--model", type=str, choices=["swinunet"], default="swinunet")
-parser.add_argument("--model-size", type=str, choices=["tiny", "small", "base"], default="small")
-parser.add_argument("--patch-size", type=int, default=128)
-parser.add_argument("--dataset-root", type=str, default="/home/jovyan/nfs/tesista3/landslide-detection/Landslides/PlanetScope/patches/")
-parser.add_argument("--warmup-epochs", type=int, default=10)
-parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--batch-size", type=int, default=2)
-parser.add_argument("--train-events", type=str, nargs="+",
-                    default=["Philippines2019", "Michoacan2022", "EmiliaRomagna2023"])
-parser.add_argument("--val-events", type=str, nargs="+",
-                    default=["Lombok2018"])
-parser.add_argument("--resume", type=str, default=None)
-
-args = parser.parse_args()
-
-MODEL_SIZE = args.model_size
-PATCH_SIZE = args.patch_size
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("TrainLogger")
-
-BATCH_SIZE = args.batch_size
-MAIN_EPOCHS = 100
-WARMUP_EPOCHS = args.warmup_epochs
-TOTAL_EPOCHS = WARMUP_EPOCHS + MAIN_EPOCHS
-PATIENCE = 20
-
-SKIP_CHECKPOINT_BEFORE_EPOCH = WARMUP_EPOCHS
-START_EARLY_STOPPING_FROM_EPOCH = WARMUP_EPOCHS + 1
-
-LR = args.lr
-POS_WEIGHT = 1.0
-
-MODEL_SELECTION_METRIC = "AUPRC"
-THRESHOLD_SELECTION_METRIC = "F1"
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# -------------------- EVENTS ---------------------
-DATASET_DIR = Path(args.dataset_root)
-
-TRAIN_EVENTS = args.train_events
-VAL_EVENTS   = args.val_events
-
-
-# -------------------- MODEL ---------------------
-model = ChangeDetectionSwinUNet(
-    model_size=MODEL_SIZE,
-    img_size=PATCH_SIZE
-).to(device)
-
-
-# -------------------- LOSS / OPTIM ---------------------
-pos_weight = torch.tensor([POS_WEIGHT], dtype=torch.float32).to(device)
-criterion = BCEWithLogitsLoss(pos_weight=pos_weight)
-
-optimizer = optim.AdamW(
-    model.parameters(),
-    lr=LR,
-    weight_decay=1e-4
-)
-
-warmup = LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
-cosine = CosineAnnealingLR(optimizer, T_max=MAIN_EPOCHS)
-
-scheduler = SequentialLR(
-    optimizer,
-    schedulers=[warmup, cosine] if WARMUP_EPOCHS > 0 else [cosine],
-    milestones=[WARMUP_EPOCHS] if WARMUP_EPOCHS > 0 else []
-)
-
-
-# -------------------- DATASETS ---------------------
-# Planet
-planet_train = PSLandslideDataset(
-    DATASET_DIR,
-    TRAIN_EVENTS,
-    patch_size=PATCH_SIZE,
-    apply_transform=False
-)
-
-planet_val = PSLandslideDataset(
-    DATASET_DIR,
-    VAL_EVENTS,
-    patch_size=PATCH_SIZE,
-    apply_transform=False
-)
-
-# Sentinel-2
-s2_train = PSLandslideSentinel2Dataset(
-    DATASET_DIR,
-    TRAIN_EVENTS,
-    apply_transform=False
-)
-
-s2_val = PSLandslideSentinel2Dataset(
-    DATASET_DIR,
-    VAL_EVENTS,
-    apply_transform=False
-)
-
-# Multimodal
-train_dataset = MultiModalLandslideDataset(
-    planet_train,
-    s2_train,
-    apply_transform=True
-)
-
-val_dataset = MultiModalLandslideDataset(
-    planet_val,
-    s2_val,
-    apply_transform=False
-)
-
-
-# -------------------- SAMPLER & LOADER ---------------------
-#train_sampler = BalancedPosNegSampler(train_dataset, PATCH_SIZE)
-#sampler=train_sampler,
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=2,
-    worker_init_fn=seed_worker,
-    generator=g
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    num_workers=2,
-    worker_init_fn=seed_worker,
-    generator=g,
-    pin_memory=False
-)
-
-
 # --------------------------- functions -------------------------------
-def create_experiment_dir() -> Path:
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the multimodal landslide model")
+    parser.add_argument("--description", required=True)
+    parser.add_argument("--model", choices=["swinunet"], default="swinunet")
+    parser.add_argument("--model-size", choices=["tiny", "small", "base"], default="small")
+    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("/home/jovyan/nfs/tesista3/landslide-detection/Landslides/PlanetScope/patches/"),
+    )
+    parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--train-events", nargs="+",
+        default=["Philippines2019", "Michoacan2022", "EmiliaRomagna2023"],
+    )
+    parser.add_argument("--val-events", nargs="+", default=["Lombok2018"])
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--pos-weight", type=float, default=1.0)
+    parser.add_argument("--balanced-sampling", action="store_true")
+    return parser.parse_args(argv)
+
+
+def create_experiment_dir(args) -> Path:
     """Create a uniquely named experiment directory, or resume an existing one."""
     if args.resume:
         p = Path(args.resume)
-        assert p.exists(), f"Cartella non trovata: {p}"
+        if not p.is_dir():
+            raise FileNotFoundError(f"Cartella esperimento non trovata: {p}")
         return p
 
-    base_name = f"{args.model}_{PATCH_SIZE}"
+    base_name = f"{args.model}_{args.patch_size}"
 
     exp_root = Path("exp")
     exp_root.mkdir(exist_ok=True)
@@ -222,17 +114,9 @@ def create_experiment_dir() -> Path:
     experiment_dir.mkdir(parents=True, exist_ok=False)
     return experiment_dir
 
-
-def extract_criterion_params(crit: BCEWithLogitsLoss) -> dict:
-    try:
-        return {k: v for k, v in vars(crit).items() if not k.startswith("_")}
-    except AttributeError:
-        return {}
-
-
 # -------------------- VALIDATION ---------------------
 @torch.no_grad()
-def validate(loader, model, criterion, th_metric="F1"):
+def validate(loader, model, criterion):
     device = next(model.parameters()).device
     model.eval()
 
@@ -247,7 +131,7 @@ def validate(loader, model, criterion, th_metric="F1"):
     for batch in tqdm(loader, desc="Validating", ncols=100):
         if not batch_contract_checked:
             validate_multimodal_batch(
-                batch, loader.dataset.s2_ds.n_temporal, "validation"
+                batch, batch["s2_pre"].shape[1], "validation"
             )
             logger.info(
                 "Validation DataLoader modalities: %s; model inputs: %s",
@@ -289,9 +173,12 @@ def validate(loader, model, criterion, th_metric="F1"):
 
     precision, recall, thresholds = pr_curve.compute()
     f1 = 2 * precision * recall / (precision + recall + 1e-9)
-
-    best_idx = torch.argmax(f1).item()
-    best_thr = thresholds[best_idx - 1].item() if best_idx > 0 else 0.0
+    if thresholds.numel() == 0:
+        raise RuntimeError("PR curve has no threshold; validation labels are degenerate")
+    # The final precision/recall point has no threshold and cannot select an
+    # operating point. Each preceding point aligns with thresholds[index].
+    best_idx = torch.argmax(f1[:-1]).item()
+    best_thr = thresholds[best_idx].item()
 
     y_prob = torch.cat(all_probs).flatten()
     y_true = torch.cat(all_masks).flatten()
@@ -315,77 +202,58 @@ def validate(loader, model, criterion, th_metric="F1"):
         "iou": iou,
     }, best_thr, pr_curve_data, best_idx
 
+def write_results(results):
+    (EXPERIMENT_DIR / "results.json").write_text(
+        json.dumps(results, indent=2), encoding="utf-8"
+    )
 
-EXPERIMENT_DIR = create_experiment_dir()
-logger.info(f"Experiment dir: {EXPERIMENT_DIR}")
 
-writer = SummaryWriter(log_dir=EXPERIMENT_DIR / "logs")
+def append_experiment(results):
+    path = EXPERIMENT_DIR.parent / "experiments.csv"
+    row = {"experiment": str(EXPERIMENT_DIR), **RUN_CONFIG, **results}
+    existing = []
+    if path.exists():
+        with path.open("r", newline="", encoding="utf-8") as file:
+            existing = list(csv.DictReader(file))
+    fields = sorted({key for record in existing + [row] for key in record})
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer_csv = csv.DictWriter(file, fieldnames=fields)
+        writer_csv.writeheader()
+        writer_csv.writerows(existing + [row])
 
 
 # -------------------- TRAIN LOOP ---------------------
-def load_model_state(model, state_dict):
-    """Load an old no-AUX checkpoint without discarding its learned fusion weights."""
-    target_state = model.state_dict()
-    compatible = {}
-    expanded_fusions = []
-
-    for name, source in state_dict.items():
-        target = target_state.get(name)
-        if target is None:
-            continue
-        if source.shape == target.shape:
-            compatible[name] = source
-        elif (
-            name.startswith("fusion_stages.")
-            and source.ndim == target.ndim == 4
-            and source.shape[0] == target.shape[0]
-            and source.shape[1] < target.shape[1]
-            and source.shape[2:] == target.shape[2:]
-        ):
-            migrated = target.clone()
-            migrated[:, :source.shape[1]] = source
-            compatible[name] = migrated
-            expanded_fusions.append(name)
-
-    missing, unexpected = model.load_state_dict(compatible, strict=False)
-    migrated = bool(expanded_fusions or missing or unexpected)
-    return migrated, missing, unexpected, expanded_fusions
-
-
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs):
-    best_model_score = 0
+    best_model_score = float("-inf")
     best_threshold = 0.5
+    best_epoch = None
+    best_metrics = {}
     epochs_without_improvement = 0
     start_epoch = 0
 
     checkpoint_path = EXPERIMENT_DIR / "checkpoint_last.pth"
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        migrated, missing, unexpected, expanded = load_model_state(
-            model, checkpoint["model_state_dict"]
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Checkpoint incompatibile con l'architettura multimodale AUX; "
+                "avviare un nuovo training."
+            ) from error
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        best_model_score = checkpoint["best_model_score"]
+        best_threshold = checkpoint["best_threshold"]
+        best_epoch = checkpoint.get("best_epoch")
+        best_metrics = checkpoint.get("best_metrics", {})
+        start_epoch = checkpoint["epoch"] + 1
+        epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+        logger.info(
+            "Ripreso dal checkpoint: epoca %s, epoche senza miglioramento: %s",
+            start_epoch,
+            epochs_without_improvement,
         )
-        if migrated:
-            logger.warning(
-                "Checkpoint precedente migrato: riusati i pesi compatibili; "
-                "AUX e nuove colonne di fusione sono inizializzati. "
-                "Optimizer, scheduler ed epoca ripartono da zero. "
-                "missing=%s, unexpected=%s, fusion=%s",
-                missing,
-                unexpected,
-                expanded,
-            )
-        else:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            best_model_score = checkpoint["best_model_score"]
-            best_threshold = checkpoint["best_threshold"]
-            start_epoch = checkpoint["epoch"] + 1
-            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
-            logger.info(
-                "Ripreso dal checkpoint: epoca %s, epoche senza miglioramento: %s",
-                start_epoch,
-                epochs_without_improvement,
-            )
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -396,7 +264,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
             for batch in pbar:
                 if not batch_contract_checked:
                     validate_multimodal_batch(
-                        batch, train_loader.dataset.s2_ds.n_temporal, "training"
+                        batch, batch["s2_pre"].shape[1], "training"
                     )
                     logger.info(
                         "Training DataLoader modalities: %s; model inputs: %s",
@@ -439,6 +307,15 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         )
 
         model_score = val_metrics[MODEL_SELECTION_METRIC]
+        is_best = model_score > best_model_score
+        if is_best:
+            best_model_score = model_score
+            best_threshold = best_thr
+            best_epoch = epoch + 1
+            best_metrics = val_metrics.copy()
+            epochs_without_improvement = 0
+        elif epoch >= START_EARLY_STOPPING_FROM_EPOCH:
+            epochs_without_improvement += 1
 
         logger.info(
             f"Epoch {epoch+1} | "
@@ -448,50 +325,201 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
             f"IoU: {val_metrics['iou']:.4f}"
         )
 
-        torch.save({
+        train_loss = total_loss / max(total_samples, 1)
+        history_row = {"epoch": epoch + 1, "train_loss": train_loss, **val_metrics,
+                       "threshold": best_thr, "best_score": best_model_score}
+        history_path = EXPERIMENT_DIR / "history.csv"
+        with history_path.open("a", newline="", encoding="utf-8") as file:
+            writer_csv = csv.DictWriter(file, fieldnames=history_row.keys())
+            if file.tell() == 0:
+                writer_csv.writeheader()
+            writer_csv.writerow(history_row)
+        for name, value in history_row.items():
+            if isinstance(value, (int, float)):
+                writer.add_scalar(name, value, epoch + 1)
+
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'best_model_score': best_model_score,
             'best_threshold': best_threshold,
+            'best_epoch': best_epoch,
+            'best_metrics': best_metrics,
             'epochs_without_improvement': epochs_without_improvement,
-        }, EXPERIMENT_DIR / "checkpoint_last.pth")
+            'metrics': val_metrics,
+            'config': RUN_CONFIG,
+        }
+        torch.save(checkpoint, EXPERIMENT_DIR / "checkpoint_last.pth")
 
-        if epoch >= START_EARLY_STOPPING_FROM_EPOCH:
-            if model_score > best_model_score:
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= PATIENCE:
-                    logger.info("Early stopping triggered")
-                    break
-
-        if model_score > best_model_score:
-            best_model_score = model_score
-            best_threshold = best_thr
-            torch.save(model.state_dict(), EXPERIMENT_DIR / "best_model.pth")
+        if is_best:
+            torch.save(checkpoint, EXPERIMENT_DIR / "best_model.pth")
             logger.info(f"Saved best model (AUPRC: {best_model_score:.4f})")
 
             # Salva PR curve CSV
             precision_np = pr_curve_data["precision"].numpy()
             recall_np    = pr_curve_data["recall"].numpy()
             thr_np       = pr_curve_data["thresholds"].numpy()
-            thr_padded   = np.concatenate([[0.0], thr_np])
             with open(EXPERIMENT_DIR / "val_pr_curve.csv", "w", newline="") as f:
                 writer_csv = csv.writer(f)
                 writer_csv.writerow(["threshold", "precision", "recall"])
-                for t, p, r in zip(thr_padded, precision_np, recall_np):
+                for t, p, r in zip(thr_np, precision_np[:-1], recall_np[:-1]):
                     writer_csv.writerow([t, p, r])
 
             # Salva PR curve PNG
             plot_pr_curve(
-                recall_np,
-                precision_np,
+                pr_curve_data,
+                best_idx,
                 auprc=best_model_score,
                 save_path=EXPERIMENT_DIR / "val_pr_curve.png"
             )
 
+        if epoch >= START_EARLY_STOPPING_FROM_EPOCH and epochs_without_improvement >= PATIENCE:
+            results = {
+                "termination_reason": "early_stopping",
+                "best_epoch": best_epoch,
+                "best_score": best_model_score,
+                "best_threshold": best_threshold,
+                **{f"best_{key}": value for key, value in best_metrics.items()},
+            }
+            write_results(results)
+            append_experiment(results)
+            logger.info("Early stopping triggered")
+            return
+
+    results = {
+        "termination_reason": "completed",
+        "best_epoch": best_epoch,
+        "best_score": best_model_score,
+        "best_threshold": best_threshold,
+        **{f"best_{key}": value for key, value in best_metrics.items()},
+    }
+    write_results(results)
+    append_experiment(results)
+
+
+def build_runtime(args):
+    """Create training objects after CLI parsing, never at module import time."""
+    global EXPERIMENT_DIR, RUN_CONFIG, START_EARLY_STOPPING_FROM_EPOCH
+    global device, writer
+
+    if args.epochs < 1 or args.warmup_epochs < 0:
+        raise ValueError("--epochs deve essere >= 1 e --warmup-epochs >= 0")
+
+    set_seed(SEED)
+    generator = torch.Generator().manual_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    total_epochs = args.warmup_epochs + args.epochs
+    START_EARLY_STOPPING_FROM_EPOCH = args.warmup_epochs + 1
+
+    model = ChangeDetectionSwinUNet(
+        model_size=args.model_size,
+        img_size=args.patch_size,
+    ).to(device)
+    criterion = BCEWithLogitsLoss(
+        pos_weight=torch.tensor([args.pos_weight], dtype=torch.float32, device=device)
+    )
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    cosine = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    if args.warmup_epochs:
+        warmup = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            total_iters=args.warmup_epochs,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[args.warmup_epochs],
+        )
+    else:
+        scheduler = cosine
+
+    planet_train = PSLandslideDataset(
+        args.dataset_root,
+        args.train_events,
+        patch_size=args.patch_size,
+        apply_transform=False,
+    )
+    planet_val = PSLandslideDataset(
+        args.dataset_root,
+        args.val_events,
+        patch_size=args.patch_size,
+        apply_transform=False,
+    )
+    s2_train = PSLandslideSentinel2Dataset(
+        args.dataset_root, args.train_events, apply_transform=False
+    )
+    s2_val = PSLandslideSentinel2Dataset(
+        args.dataset_root, args.val_events, apply_transform=False
+    )
+    train_dataset = MultiModalLandslideDataset(
+        planet_train, s2_train, apply_transform=True
+    )
+    val_dataset = MultiModalLandslideDataset(
+        planet_val, s2_val, apply_transform=False
+    )
+    train_sampler = (
+        BalancedPosNegSampler(train_dataset, args.patch_size)
+        if args.balanced_sampling
+        else None
+    )
+    logger.info(
+        "Training sampler: %s; pos_weight=%s",
+        "balanced" if train_sampler else "shuffle",
+        args.pos_weight,
+    )
+    loader_options = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+    }
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        **loader_options,
+    )
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
+
+    EXPERIMENT_DIR = create_experiment_dir(args)
+    logger.info("Experiment dir: %s", EXPERIMENT_DIR)
+    writer = SummaryWriter(log_dir=EXPERIMENT_DIR / "logs")
+    RUN_CONFIG = {
+        "description": args.description,
+        "model": args.model,
+        "model_size": args.model_size,
+        "patch_size": args.patch_size,
+        "dataset_root": str(args.dataset_root),
+        "train_events": args.train_events,
+        "val_events": args.val_events,
+        "epochs": total_epochs,
+        "main_epochs": args.epochs,
+        "warmup_epochs": args.warmup_epochs,
+        "learning_rate": args.lr,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pos_weight": args.pos_weight,
+        "balanced_sampling": args.balanced_sampling,
+        "seed": SEED,
+    }
+    (EXPERIMENT_DIR / "config.json").write_text(
+        json.dumps(RUN_CONFIG, indent=2), encoding="utf-8"
+    )
+    return model, train_loader, val_loader, criterion, optimizer, scheduler, total_epochs
+
+
+def main(argv=None):
+    try:
+        runtime = build_runtime(parse_args(argv))
+        train(*runtime)
+    finally:
+        if writer is not None:
+            writer.close()
+    return 0
+
 
 if __name__ == "__main__":
-    train(model, train_loader, val_loader, criterion, optimizer, scheduler, TOTAL_EPOCHS)
+    raise SystemExit(main())
