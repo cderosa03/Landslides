@@ -80,8 +80,9 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--val-batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument(
         "--profile-batches",
         type=int,
@@ -644,7 +645,6 @@ def build_runtime(args):
         args.pos_weight,
     )
     loader_options = {
-        "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "worker_init_fn": seed_worker,
         "generator": generator,
@@ -657,11 +657,17 @@ def build_runtime(args):
         })
     train_loader = DataLoader(
         train_dataset,
+        batch_size=args.batch_size,
         shuffle=train_sampler is None,
         sampler=train_sampler,
         **loader_options,
     )
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        **loader_options,
+    )
 
     EXPERIMENT_DIR = create_experiment_dir(args)
     logger.info("Experiment dir: %s", EXPERIMENT_DIR)
@@ -679,6 +685,7 @@ def build_runtime(args):
         "warmup_epochs": args.warmup_epochs,
         "learning_rate": args.lr,
         "batch_size": args.batch_size,
+        "val_batch_size": args.val_batch_size,
         "num_workers": args.num_workers,
         "pin_memory": loader_options["pin_memory"],
         "persistent_workers": loader_options.get("persistent_workers", False),
