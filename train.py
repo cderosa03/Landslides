@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import os
 import random
+import time
 import torch
 import torch.optim as optim
 
@@ -80,7 +81,13 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=12)
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        default=0,
+        help="Misura i tempi per i primi N batch di ogni fase; 0 disabilita il profiling dettagliato.",
+    )
     parser.add_argument(
         "--train-events", nargs="+",
         default=["Philippines2019", "Michoacan2022", "EmiliaRomagna2023"],
@@ -90,6 +97,44 @@ def parse_args(argv=None):
     parser.add_argument("--pos-weight", type=float, default=1.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     return parser.parse_args(argv)
+
+
+def _cuda_synchronize() -> None:
+    """Synchronize only when CUDA timings need to be measured."""
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _log_profile(scope, timing, profiled_batches, total_batches, total_seconds):
+    """Log phase timings without adding synchronization to normal runs."""
+    average_seconds = total_seconds / max(total_batches, 1)
+    logger.info(
+        "%s total: %.3fs; batches: %d; average batch: %.3fs",
+        scope,
+        total_seconds,
+        total_batches,
+        average_seconds,
+    )
+    if not profiled_batches:
+        return
+    labels = {
+        "load": "load",
+        "cpu_to_gpu": "cpu_to_gpu",
+        "forward": "forward",
+        "backward": "backward",
+        "optimizer": "optimizer",
+    }
+    parts = [
+        f"{labels[key]}={timing[key] * 1000 / profiled_batches:.3f}ms"
+        for key in labels
+        if key in timing
+    ]
+    logger.info(
+        "%s profiled first %d batches: %s",
+        scope,
+        profiled_batches,
+        "; ".join(parts),
+    )
 
 
 def create_experiment_dir(args) -> Path:
@@ -116,7 +161,7 @@ def create_experiment_dir(args) -> Path:
 
 # -------------------- VALIDATION ---------------------
 @torch.no_grad()
-def validate(loader, model, criterion):
+def validate(loader, model, criterion, profile_batches=0):
     device = next(model.parameters()).device
     model.eval()
 
@@ -126,50 +171,85 @@ def validate(loader, model, criterion):
 
     all_probs, all_masks = [], []
     running_loss, n_batches = 0.0, 0
+    phase_started = time.perf_counter()
+    timing = {"load": 0.0, "cpu_to_gpu": 0.0, "forward": 0.0}
+    profiled = 0
 
     batch_contract_checked = False
-    for batch in tqdm(loader, desc="Validating", ncols=100):
-        if not batch_contract_checked:
-            validate_multimodal_batch(
-                batch, batch["s2_pre"].shape[1], "validation"
+    loader_iter = iter(loader)
+    with tqdm(total=len(loader), desc="Validating", ncols=100) as pbar:
+        while True:
+            load_started = time.perf_counter()
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break
+            load_seconds = time.perf_counter() - load_started
+            profile_this = profile_batches > 0 and profiled < profile_batches
+            if profile_this:
+                _cuda_synchronize()
+
+            transfer_started = time.perf_counter()
+            gt_mask = batch["mask"].to(device, non_blocking=True)
+            s2_pre = batch["s2_pre"].to(device, non_blocking=True)
+            s2_post = batch["s2_post"].to(device, non_blocking=True)
+            planet_pre = batch["planet_pre"].to(device, non_blocking=True)
+            planet_post = batch["planet_post"].to(device, non_blocking=True)
+            aux = batch["aux"].to(device, non_blocking=True)
+            valid_t1 = batch["s2_valid_pre"].to(device, non_blocking=True)
+            valid_t2 = batch["s2_valid_post"].to(device, non_blocking=True)
+            if profile_this:
+                _cuda_synchronize()
+                timing["load"] += load_seconds
+                timing["cpu_to_gpu"] += time.perf_counter() - transfer_started
+
+            if not batch_contract_checked:
+                validate_multimodal_batch(
+                    batch, batch["s2_pre"].shape[1], "validation"
+                )
+                logger.info(
+                    "Validation DataLoader modalities: %s; model inputs: %s",
+                    {
+                        key: tuple(value.shape)
+                        for key, value in batch.items()
+                        if isinstance(value, torch.Tensor)
+                    },
+                    [
+                        "s2_pre", "s2_post", "planet_pre", "planet_post",
+                        "aux", "s2_valid_pre", "s2_valid_post",
+                    ],
+                )
+                batch_contract_checked = True
+
+            forward_started = time.perf_counter()
+            logits = model(
+                s2_pre,
+                s2_post,
+                planet_pre,
+                planet_post,
+                aux,
+                valid_t1=valid_t1,
+                valid_t2=valid_t2,
             )
-            logger.info(
-                "Validation DataLoader modalities: %s; model inputs: %s",
-                {
-                    key: tuple(value.shape)
-                    for key, value in batch.items()
-                    if isinstance(value, torch.Tensor)
-                },
-                [
-                    "s2_pre", "s2_post", "planet_pre", "planet_post",
-                    "aux", "s2_valid_pre", "s2_valid_post",
-                ],
-            )
-            batch_contract_checked = True
-        gt_mask = batch["mask"].to(device, non_blocking=True)
+            if profile_this:
+                _cuda_synchronize()
+                timing["forward"] += time.perf_counter() - forward_started
 
-        logits = model(
-            batch["s2_pre"].to(device, non_blocking=True),
-            batch["s2_post"].to(device, non_blocking=True),
-            batch["planet_pre"].to(device, non_blocking=True),
-            batch["planet_post"].to(device, non_blocking=True),
-            batch["aux"].to(device, non_blocking=True),
-            valid_t1=batch["s2_valid_pre"].to(device, non_blocking=True),
-            valid_t2=batch["s2_valid_post"].to(device, non_blocking=True),
-        )
+            loss = criterion(logits, gt_mask.float())
 
-        loss = criterion(logits, gt_mask.float())
+            running_loss += loss.item()
+            n_batches += 1
 
-        running_loss += loss.item()
-        n_batches += 1
+            probs = torch.sigmoid(logits)
+            pr_curve.update(probs, gt_mask)
+            auprc_m.update(probs, gt_mask)
+            auroc_m.update(probs, gt_mask)
 
-        probs = torch.sigmoid(logits)
-        pr_curve.update(probs, gt_mask)
-        auprc_m.update(probs, gt_mask)
-        auroc_m.update(probs, gt_mask)
-
-        all_probs.append(probs.cpu())
-        all_masks.append(gt_mask.cpu())
+            all_probs.append(probs.cpu())
+            all_masks.append(gt_mask.cpu())
+            if profile_this:
+                profiled += 1
+            pbar.update(1)
 
     precision, recall, thresholds = pr_curve.compute()
     f1 = 2 * precision * recall / (precision + recall + 1e-9)
@@ -191,6 +271,14 @@ def validate(loader, model, criterion):
         "recall": recall.cpu(),
         "thresholds": thresholds.cpu(),
     }
+    phase_seconds = time.perf_counter() - phase_started
+    _log_profile(
+        "Validation",
+        timing,
+        profiled,
+        n_batches,
+        phase_seconds,
+    )
 
     return {
         "val_loss": running_loss / max(n_batches, 1),
@@ -223,7 +311,16 @@ def append_experiment(results):
 
 
 # -------------------- TRAIN LOOP ---------------------
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs):
+def train(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    epochs,
+    profile_batches=0,
+):
     best_model_score = float("-inf")
     best_threshold = 0.5
     best_epoch = None
@@ -232,6 +329,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
     start_epoch = 0
 
     checkpoint_path = EXPERIMENT_DIR / "checkpoint_last.pth"
+    training_started = time.perf_counter()
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
         try:
@@ -259,9 +357,45 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         model.train()
         total_loss, total_samples = 0.0, 0
         batch_contract_checked = False
+        epoch_started = time.perf_counter()
+        timing = {
+            "load": 0.0,
+            "cpu_to_gpu": 0.0,
+            "forward": 0.0,
+            "backward": 0.0,
+            "optimizer": 0.0,
+        }
+        profiled = 0
 
-        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", ncols=100) as pbar:
-            for batch in pbar:
+        loader_iter = iter(train_loader)
+        with tqdm(
+            total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", ncols=100
+        ) as pbar:
+            while True:
+                load_started = time.perf_counter()
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    break
+                load_seconds = time.perf_counter() - load_started
+                profile_this = profile_batches > 0 and profiled < profile_batches
+                if profile_this:
+                    _cuda_synchronize()
+
+                transfer_started = time.perf_counter()
+                gt_mask = batch["mask"].to(device, non_blocking=True)
+                s2_pre = batch["s2_pre"].to(device, non_blocking=True)
+                s2_post = batch["s2_post"].to(device, non_blocking=True)
+                planet_pre = batch["planet_pre"].to(device, non_blocking=True)
+                planet_post = batch["planet_post"].to(device, non_blocking=True)
+                aux = batch["aux"].to(device, non_blocking=True)
+                valid_t1 = batch["s2_valid_pre"].to(device, non_blocking=True)
+                valid_t2 = batch["s2_valid_post"].to(device, non_blocking=True)
+                if profile_this:
+                    _cuda_synchronize()
+                    timing["load"] += load_seconds
+                    timing["cpu_to_gpu"] += time.perf_counter() - transfer_started
+
                 if not batch_contract_checked:
                     validate_multimodal_batch(
                         batch, batch["s2_pre"].shape[1], "training"
@@ -279,31 +413,56 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
                         ],
                     )
                     batch_contract_checked = True
-                gt_mask = batch["mask"].to(device)
 
                 optimizer.zero_grad()
+                forward_started = time.perf_counter()
                 logits = model(
-                    batch["s2_pre"].to(device),
-                    batch["s2_post"].to(device),
-                    batch["planet_pre"].to(device),
-                    batch["planet_post"].to(device),
-                    batch["aux"].to(device),
-                    valid_t1=batch["s2_valid_pre"].to(device),
-                    valid_t2=batch["s2_valid_post"].to(device),
+                    s2_pre,
+                    s2_post,
+                    planet_pre,
+                    planet_post,
+                    aux,
+                    valid_t1=valid_t1,
+                    valid_t2=valid_t2,
                 )
+                if profile_this:
+                    _cuda_synchronize()
+                    timing["forward"] += time.perf_counter() - forward_started
 
                 loss = criterion(logits, gt_mask.float())
+
+                backward_started = time.perf_counter()
                 loss.backward()
+                if profile_this:
+                    _cuda_synchronize()
+                    timing["backward"] += time.perf_counter() - backward_started
+
+                optimizer_started = time.perf_counter()
                 optimizer.step()
+                if profile_this:
+                    _cuda_synchronize()
+                    timing["optimizer"] += time.perf_counter() - optimizer_started
 
                 total_loss += loss.item() * gt_mask.size(0)
                 total_samples += gt_mask.size(0)
                 pbar.set_postfix(loss=total_loss / total_samples)
+                if profile_this:
+                    profiled += 1
+                pbar.update(1)
+
+        epoch_seconds = time.perf_counter() - epoch_started
+        _log_profile(
+            f"Epoch {epoch + 1} training",
+            timing,
+            profiled,
+            len(train_loader),
+            epoch_seconds,
+        )
 
         scheduler.step()
 
         val_metrics, best_thr, pr_curve_data, best_idx = validate(
-            val_loader, model, criterion
+            val_loader, model, criterion, profile_batches=profile_batches
         )
 
         model_score = val_metrics[MODEL_SELECTION_METRIC]
@@ -385,6 +544,12 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
             }
             write_results(results)
             append_experiment(results)
+            total_seconds = time.perf_counter() - training_started
+            logger.info(
+                "Training total until early stopping: %.3fs (%.2fh)",
+                total_seconds,
+                total_seconds / 3600,
+            )
             logger.info("Early stopping triggered")
             return
 
@@ -397,6 +562,12 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
     }
     write_results(results)
     append_experiment(results)
+    total_seconds = time.perf_counter() - training_started
+    logger.info(
+        "Training total: %.3fs (%.2fh)",
+        total_seconds,
+        total_seconds / 3600,
+    )
 
 
 def build_runtime(args):
@@ -406,6 +577,8 @@ def build_runtime(args):
 
     if args.epochs < 1 or args.warmup_epochs < 0:
         raise ValueError("--epochs deve essere >= 1 e --warmup-epochs >= 0")
+    if args.profile_batches < 0:
+        raise ValueError("--profile-batches deve essere >= 0")
 
     set_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
@@ -475,7 +648,13 @@ def build_runtime(args):
         "num_workers": args.num_workers,
         "worker_init_fn": seed_worker,
         "generator": generator,
+        "pin_memory": True,
     }
+    if args.num_workers > 0:
+        loader_options.update({
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+        })
     train_loader = DataLoader(
         train_dataset,
         shuffle=train_sampler is None,
@@ -501,6 +680,10 @@ def build_runtime(args):
         "learning_rate": args.lr,
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
+        "pin_memory": loader_options["pin_memory"],
+        "persistent_workers": loader_options.get("persistent_workers", False),
+        "prefetch_factor": loader_options.get("prefetch_factor"),
+        "profile_batches": args.profile_batches,
         "pos_weight": args.pos_weight,
         "balanced_sampling": args.balanced_sampling,
         "seed": SEED,
@@ -508,7 +691,16 @@ def build_runtime(args):
     (EXPERIMENT_DIR / "config.json").write_text(
         json.dumps(RUN_CONFIG, indent=2), encoding="utf-8"
     )
-    return model, train_loader, val_loader, criterion, optimizer, scheduler, total_epochs
+    return (
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        total_epochs,
+        args.profile_batches,
+    )
 
 
 def main(argv=None):

@@ -104,7 +104,7 @@ python train.py \
   --description "smoke multimodale" \
   --dataset-root /dati/PlanetScope/patches \
   --model-size tiny --patch-size 128 \
-  --warmup-epochs 0 --epochs 1 --batch-size 2
+  --warmup-epochs 0 --epochs 1 --batch-size 2 --num-workers 12
 ```
 
 Per un training completo aumentare `--epochs` e, se necessario, usare
