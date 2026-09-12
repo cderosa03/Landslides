@@ -26,7 +26,6 @@ from torchmetrics.classification import (
     BinaryAveragePrecision,
     BinaryAUROC
 )
-from torchmetrics.functional import jaccard_index
 from tqdm import tqdm
 from utils.plot import plot_pr_curve
 
@@ -166,11 +165,14 @@ def validate(loader, model, criterion, profile_batches=0):
     device = next(model.parameters()).device
     model.eval()
 
-    pr_curve = BinaryPrecisionRecallCurve().to(device)
-    auprc_m = BinaryAveragePrecision().to(device)
-    auroc_m = BinaryAUROC().to(device)
+    # Fixed thresholds keep metric state bounded.  Without them TorchMetrics
+    # stores every validation pixel until compute(), which can exhaust memory
+    # on large validation sets.
+    metric_thresholds = 512
+    pr_curve = BinaryPrecisionRecallCurve(thresholds=metric_thresholds).to(device)
+    auprc_m = BinaryAveragePrecision(thresholds=metric_thresholds).to(device)
+    auroc_m = BinaryAUROC(thresholds=metric_thresholds).to(device)
 
-    all_probs, all_masks = [], []
     running_loss, n_batches = 0.0, 0
     phase_started = time.perf_counter()
     timing = {"load": 0.0, "cpu_to_gpu": 0.0, "forward": 0.0}
@@ -246,8 +248,6 @@ def validate(loader, model, criterion, profile_batches=0):
             auprc_m.update(probs, gt_mask)
             auroc_m.update(probs, gt_mask)
 
-            all_probs.append(probs.cpu())
-            all_masks.append(gt_mask.cpu())
             if profile_this:
                 profiled += 1
             pbar.update(1)
@@ -261,11 +261,10 @@ def validate(loader, model, criterion, profile_batches=0):
     best_idx = torch.argmax(f1[:-1]).item()
     best_thr = thresholds[best_idx].item()
 
-    y_prob = torch.cat(all_probs).flatten()
-    y_true = torch.cat(all_masks).flatten()
-    y_pred = (y_prob >= best_thr).int()
-
-    iou = jaccard_index(y_pred, y_true.int(), task="binary").item()
+    # For a binary confusion matrix, IoU = F1 / (2 - F1).  This avoids
+    # retaining every prediction just to recompute IoU at the best threshold.
+    best_f1 = f1[best_idx]
+    iou = (best_f1 / (2.0 - best_f1 + 1e-9)).item()
 
     pr_curve_data = {
         "precision": precision.cpu(),
