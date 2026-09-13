@@ -647,12 +647,19 @@ def build_runtime(args):
         "num_workers": args.num_workers,
         "worker_init_fn": seed_worker,
         "generator": generator,
-        "pin_memory": True,
+        # Pinning is useful only for CUDA transfers and otherwise consumes
+        # additional host memory.
+        "pin_memory": device.type == "cuda",
     }
     if args.num_workers > 0:
         loader_options.update({
-            "persistent_workers": True,
-            "prefetch_factor": 2,
+            # Do not keep the training worker pool alive while validation
+            # starts a second pool.  This also releases GDAL/Rasterio caches
+            # between phases and bounds host-memory use over long epochs.
+            "persistent_workers": False,
+            "prefetch_factor": 1,
+            # Surface a stuck NFS/GeoTIFF read instead of waiting forever.
+            "timeout": 120,
         })
     train_loader = DataLoader(
         train_dataset,
