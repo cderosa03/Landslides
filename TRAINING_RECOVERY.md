@@ -39,9 +39,13 @@ training EmiliaRomagna2023 e validation Michoacan2022.
 bash run_stable_training.sh smoke
 ```
 
-La prova indicizza gli eventi completi (questa fase puo richiedere minuti),
-poi esegue 20 batch di training e fino a 4 di validation su un sottoinsieme
-casuale riproducibile. Si interrompe dopo 45 minuti se non termina prima.
+La prova cerca soltanto le patch Sentinel valide necessarie a 20 batch di
+training e fino a 4 di validation, poi indicizza Planet solo per quelle patch.
+Le directory candidate sono visitate in ordine casuale riproducibile; le patch
+senza coppia temporale o senza tutti i file Planet non consumano il limite.
+Il contatore mostra le singole patch e il log registra l'avanzamento ogni
+15 secondi durante la scansione. Il training completo continua a usare tutti
+i campioni validi. La prova si interrompe dopo 45 minuti se non termina prima.
 Il successo e indicato da `SMOKE TEST PASSED`. Gli esperimenti `_smoke`
 sono diagnostici: metriche escluse da `experiments.csv`, checkpoint non
 riutilizzabili con `--resume` per il training completo.

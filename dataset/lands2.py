@@ -2,6 +2,8 @@ import logging
 from collections import Counter
 import numpy as np
 import os
+import random
+import time
 import torch
 import rasterio
 from datetime import datetime
@@ -65,6 +67,9 @@ class PSLandslideSentinel2Dataset(Dataset):
         normalize=True,
         n_temporal=N_TEMPORAL,
         patch_ids=None,
+        sample_limit=None,
+        required_files=(),
+        index_seed=42,
     ):
         if apply_transform:
             raise ValueError(
@@ -77,6 +82,11 @@ class PSLandslideSentinel2Dataset(Dataset):
         self.normalize = normalize
         self.n_temporal = n_temporal
         self.excluded = Counter()
+        if sample_limit is not None and sample_limit < 1:
+            raise ValueError("sample_limit must be positive")
+        self.sample_limit = sample_limit
+        self.required_files = tuple(required_files)
+        self.index_seed = index_seed
 
         self.samples = self._collect_samples()
 
@@ -88,6 +98,7 @@ class PSLandslideSentinel2Dataset(Dataset):
     # ── Costruzione indice ────────────────────────────────────────────────
     def _collect_samples(self):
         samples = []
+        rng = random.Random(self.index_seed)
 
         for event in tqdm(self.events, desc="Lettura eventi S2"):
             cutoff = EVENT_CUTOFFS.get(event)
@@ -101,17 +112,28 @@ class PSLandslideSentinel2Dataset(Dataset):
                 self.excluded["missing_event_directory"] += 1
                 continue
 
-            patch_dirs = sorted(
-                [
-                    p for p in event_dir.iterdir()
-                    if p.is_dir()
-                    and p.name.isdigit()
-                    and (self.patch_ids is None or p.name in self.patch_ids)
-                ],
-                key=lambda p: int(p.name),
-            )
+            logger.info("S2 %s: lettura elenco directory", event)
+            # DirEntry can reuse directory-entry metadata; Path.is_dir() on
+            # every entry otherwise adds thousands of NFS metadata requests.
+            with os.scandir(event_dir) as entries:
+                patch_dirs = sorted(
+                    (Path(entry.path) for entry in entries if entry.name.isdigit()
+                     and (self.patch_ids is None or entry.name in self.patch_ids)
+                     and entry.is_dir()), key=lambda p: int(p.name),
+                )
+            if self.sample_limit is not None:
+                rng.shuffle(patch_dirs)
+            event_start_count = len(samples)
+            last_report = time.monotonic()
+            progress = tqdm(patch_dirs, desc=f"S2 {event}: patch", unit="patch", mininterval=1)
 
-            for patch_dir in patch_dirs:
+            for checked, patch_dir in enumerate(progress, start=1):
+                now = time.monotonic()
+                if checked == 1 or now - last_report >= 15:
+                    logger.info("S2 %s: controllo %d/%d; valide=%d; patch=%s",
+                                event, checked, len(patch_dirs),
+                                len(samples) - event_start_count, patch_dir.name)
+                    last_report = now
                 s2_dir = patch_dir / "s2"
                 if not s2_dir.exists():
                     self.excluded["missing_s2_directory"] += 1
@@ -153,6 +175,12 @@ class PSLandslideSentinel2Dataset(Dataset):
                     )
                     continue
 
+                # A bounded smoke index must count only samples that can also
+                # be read by Planet; incomplete candidates do not consume slots.
+                if any(not (patch_dir / name).is_file() for name in self.required_files):
+                    self.excluded["missing_required_planet_file"] += 1
+                    continue
+
                 logger.debug(
                     "Selected Sentinel dates for %s/%s: pre=%s post=%s",
                     event,
@@ -168,6 +196,12 @@ class PSLandslideSentinel2Dataset(Dataset):
                     "pre_dates":  pre_dates,
                     "post_dates": post_dates,
                 })
+                if self.sample_limit is not None and len(samples) >= self.sample_limit:
+                    progress.close()
+                    logger.info("S2 prova breve: %d patch valide, indice limitato", len(samples))
+                    return samples
+            logger.info("S2 %s: indice completato; %d patch valide",
+                        event, len(samples) - event_start_count)
 
         if self.excluded:
             logger.info("Sentinel samples excluded: %s", dict(self.excluded))
