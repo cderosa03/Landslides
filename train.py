@@ -1,11 +1,14 @@
 import argparse
 import csv
+import faulthandler
+from functools import partial
 import json
 import logging
 import numpy as np
 import os
 import random
 import time
+from datetime import datetime, timezone
 import torch
 import torch.optim as optim
 
@@ -19,7 +22,7 @@ from dataset.sampler import BalancedPosNegSampler
 from pathlib import Path
 from torch.nn import BCEWithLogitsLoss
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.classification import (
     BinaryPrecisionRecallCurve,
@@ -28,6 +31,7 @@ from torchmetrics.classification import (
 )
 from tqdm import tqdm
 from utils.plot import plot_pr_curve
+from utils.train_runtime import RunDiagnostics, atomic_torch_save, raster_environment
 
 
 # ------------------------ SEED -------------------------
@@ -45,6 +49,9 @@ RUN_CONFIG = None
 writer = None
 device = None
 START_EARLY_STOPPING_FROM_EPOCH = 0
+diagnostics = None
+_worker_raster_env = None
+_worker_trace_file = None
 
 
 def set_seed(seed: int) -> None:
@@ -57,11 +64,22 @@ def set_seed(seed: int) -> None:
 
 
 # -------------------- DataLoader---------------------
-def seed_worker(worker_id: int) -> None:
+def seed_worker(worker_id: int, gdal_cache_mb=256, diagnostic_dir=None) -> None:
+    global _worker_raster_env, _worker_trace_file
     worker_seed = SEED + worker_id
     np.random.seed(worker_seed)
     random.seed(worker_seed)
     torch.manual_seed(worker_seed)
+    torch.set_num_threads(1)
+    # Spawned workers own their GDAL state and retain this bounded environment
+    # for their lifetime. No CUDA calls are made in the worker.
+    _worker_raster_env = raster_environment(gdal_cache_mb)
+    _worker_raster_env.__enter__()
+    if diagnostic_dir is not None:
+        _worker_trace_file = (Path(diagnostic_dir) / f"worker_{os.getpid()}_stacks.log").open("a")
+        faulthandler.enable(file=_worker_trace_file)
+        # Periodic snapshots also expose a worker stuck inside a native read.
+        faulthandler.dump_traceback_later(300, repeat=True, file=_worker_trace_file)
 
 
 # --------------------------- functions -------------------------------
@@ -79,9 +97,26 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--val-batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=24)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--val-batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--gdal-cache-mb", type=int, default=256)
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--log-dir", type=Path, default=Path("run_logs"))
+    parser.add_argument(
+        "--smoke-batches", type=int, default=0,
+        help="Prova diagnostica: N batch training e fino a 4 validation, una sola epoca.",
+    )
+    parser.add_argument(
+        "--loader-timeout",
+        type=int,
+        default=300,
+        help=(
+            "Secondi massimi di attesa per un batch con worker DataLoader; "
+            "0 disabilita il timeout (default: 300)."
+        ),
+    )
     parser.add_argument(
         "--profile-batches",
         type=int,
@@ -103,6 +138,11 @@ def _cuda_synchronize() -> None:
     """Synchronize only when CUDA timings need to be measured."""
     if device is not None and device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _mark_progress():
+    if diagnostics is not None:
+        diagnostics.progress()
 
 
 def _log_profile(scope, timing, profiled_batches, total_batches, total_seconds):
@@ -143,9 +183,14 @@ def create_experiment_dir(args) -> Path:
         p = Path(args.resume)
         if not p.is_dir():
             raise FileNotFoundError(f"Cartella esperimento non trovata: {p}")
+        config_path = p / "config.json"
+        if config_path.exists() and json.loads(config_path.read_text(encoding="utf-8")).get("diagnostic_only", False):
+            raise ValueError("Un esperimento diagnostico non puo essere ripreso come training completo")
         return p
 
     base_name = f"{args.model}_{args.patch_size}"
+    if args.smoke_batches:
+        base_name += "_smoke"
 
     exp_root = Path("exp")
     exp_root.mkdir(exist_ok=True)
@@ -182,6 +227,7 @@ def validate(loader, model, criterion, profile_batches=0):
     loader_iter = iter(loader)
     with tqdm(total=len(loader), desc="Validating", ncols=100) as pbar:
         while True:
+            _mark_progress()
             load_started = time.perf_counter()
             try:
                 batch = next(loader_iter)
@@ -250,9 +296,18 @@ def validate(loader, model, criterion, profile_batches=0):
 
             if profile_this:
                 profiled += 1
+            if profile_this or (n_batches % 50 == 0):
+                logger.info("Validation batch %d/%d: load=%.3fs; total=%.3fs",
+                            n_batches, len(loader), load_seconds,
+                            time.perf_counter() - load_started)
             pbar.update(1)
 
     precision, recall, thresholds = pr_curve.compute()
+    # Thresholds with no predicted positives can have undefined precision.
+    # Treat undefined points as zero before argmax, so NaN cannot select the
+    # operating threshold and propagate into F1/IoU or the checkpoint.
+    precision = torch.nan_to_num(precision, nan=0.0)
+    recall = torch.nan_to_num(recall, nan=0.0)
     f1 = 2 * precision * recall / (precision + recall + 1e-9)
     if thresholds.numel() == 0:
         raise RuntimeError("PR curve has no threshold; validation labels are degenerate")
@@ -297,6 +352,8 @@ def write_results(results):
 
 
 def append_experiment(results):
+    if RUN_CONFIG.get("diagnostic_only", False):
+        return
     path = EXPERIMENT_DIR.parent / "experiments.csv"
     row = {"experiment": str(EXPERIMENT_DIR), **RUN_CONFIG, **results}
     existing = []
@@ -332,6 +389,8 @@ def train(
     training_started = time.perf_counter()
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        if checkpoint.get("config", {}).get("diagnostic_only", False):
+            raise ValueError("Un checkpoint diagnostico non puo essere ripreso come training completo")
         try:
             model.load_state_dict(checkpoint["model_state_dict"])
         except RuntimeError as error:
@@ -372,6 +431,7 @@ def train(
             total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", ncols=100
         ) as pbar:
             while True:
+                _mark_progress()
                 load_started = time.perf_counter()
                 try:
                     batch = next(loader_iter)
@@ -414,7 +474,7 @@ def train(
                     )
                     batch_contract_checked = True
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 forward_started = time.perf_counter()
                 logits = model(
                     s2_pre,
@@ -448,6 +508,14 @@ def train(
                 pbar.set_postfix(loss=total_loss / total_samples)
                 if profile_this:
                     profiled += 1
+                if profile_this or ((pbar.n + 1) % 50 == 0):
+                    logger.info(
+                        "Training batch %d/%d: load=%.3fs; total=%.3fs",
+                        pbar.n + 1,
+                        len(train_loader),
+                        load_seconds,
+                        time.perf_counter() - load_started,
+                    )
                 pbar.update(1)
 
         epoch_seconds = time.perf_counter() - epoch_started
@@ -510,10 +578,10 @@ def train(
             'metrics': val_metrics,
             'config': RUN_CONFIG,
         }
-        torch.save(checkpoint, EXPERIMENT_DIR / "checkpoint_last.pth")
+        atomic_torch_save(checkpoint, EXPERIMENT_DIR / "checkpoint_last.pth")
 
         if is_best:
-            torch.save(checkpoint, EXPERIMENT_DIR / "best_model.pth")
+            atomic_torch_save(checkpoint, EXPERIMENT_DIR / "best_model.pth")
             logger.info(f"Saved best model (AUPRC: {best_model_score:.4f})")
 
             # Salva PR curve CSV
@@ -579,6 +647,18 @@ def build_runtime(args):
         raise ValueError("--epochs deve essere >= 1 e --warmup-epochs >= 0")
     if args.profile_batches < 0:
         raise ValueError("--profile-batches deve essere >= 0")
+    if args.num_workers < 0 or args.loader_timeout < 0:
+        raise ValueError("--num-workers e --loader-timeout devono essere >= 0")
+    if min(args.gdal_cache_mb, args.cpu_threads, args.batch_size, args.val_batch_size) < 1:
+        raise ValueError("Cache, thread e batch size devono essere >= 1")
+    if args.smoke_batches < 0:
+        raise ValueError("--smoke-batches deve essere >= 0")
+    if args.smoke_batches:
+        if args.resume or args.balanced_sampling:
+            raise ValueError("La prova diagnostica non supporta --resume o --balanced-sampling")
+        args.epochs, args.warmup_epochs = 1, 0
+        args.profile_batches = max(args.profile_batches, args.smoke_batches)
+    torch.set_num_threads(args.cpu_threads)
 
     set_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
@@ -633,6 +713,15 @@ def build_runtime(args):
     val_dataset = MultiModalLandslideDataset(
         planet_val, s2_val, apply_transform=False
     )
+    if args.smoke_batches:
+        # Spread the test across the dataset using a separate deterministic RNG.
+        probe_generator = torch.Generator().manual_seed(SEED)
+        train_indices = torch.randperm(len(train_dataset), generator=probe_generator).tolist()
+        val_indices = torch.randperm(len(val_dataset), generator=probe_generator).tolist()
+        train_dataset = Subset(train_dataset, train_indices[:args.smoke_batches * args.batch_size])
+        val_dataset = Subset(val_dataset, val_indices[:min(4, args.smoke_batches) * args.val_batch_size])
+        logger.warning("DIAGNOSTIC ONLY: %d training samples, %d validation samples",
+                       len(train_dataset), len(val_dataset))
     train_sampler = (
         BalancedPosNegSampler(train_dataset, args.patch_size)
         if args.balanced_sampling
@@ -645,11 +734,12 @@ def build_runtime(args):
     )
     loader_options = {
         "num_workers": args.num_workers,
-        "worker_init_fn": seed_worker,
+        "worker_init_fn": partial(seed_worker, gdal_cache_mb=args.gdal_cache_mb,
+                                   diagnostic_dir=getattr(args, "diagnostic_dir", None)),
         "generator": generator,
         # Pinning is useful only for CUDA transfers and otherwise consumes
         # additional host memory.
-        "pin_memory": device.type == "cuda",
+        "pin_memory": args.pin_memory and device.type == "cuda",
     }
     if args.num_workers > 0:
         loader_options.update({
@@ -658,8 +748,10 @@ def build_runtime(args):
             # between phases and bounds host-memory use over long epochs.
             "persistent_workers": False,
             "prefetch_factor": 1,
-            # Surface a stuck NFS/GeoTIFF read instead of waiting forever.
-            "timeout": 120,
+            # GeoTIFF reads over NFS can occasionally exceed the usual batch time.
+            "timeout": args.loader_timeout,
+            # CUDA and GDAL have already been initialized in the parent.
+            "multiprocessing_context": "spawn",
         })
     train_loader = DataLoader(
         train_dataset,
@@ -693,9 +785,16 @@ def build_runtime(args):
         "batch_size": args.batch_size,
         "val_batch_size": args.val_batch_size,
         "num_workers": args.num_workers,
+        "loader_timeout": loader_options.get("timeout", 0),
         "pin_memory": loader_options["pin_memory"],
         "persistent_workers": loader_options.get("persistent_workers", False),
         "prefetch_factor": loader_options.get("prefetch_factor"),
+        "multiprocessing_context": loader_options.get("multiprocessing_context"),
+        "gdal_cache_mb": args.gdal_cache_mb,
+        "cpu_threads": args.cpu_threads,
+        "diagnostic_only": bool(args.smoke_batches),
+        "smoke_batches": args.smoke_batches,
+        "diagnostic_dir": str(getattr(args, "diagnostic_dir", "")),
         "profile_batches": args.profile_batches,
         "pos_weight": args.pos_weight,
         "balanced_sampling": args.balanced_sampling,
@@ -717,12 +816,37 @@ def build_runtime(args):
 
 
 def main(argv=None):
+    global diagnostics
+    args = parse_args(argv)
+    # Spawned workers import NumPy/PyTorch afresh: bound native thread pools
+    # before those imports, then set the main PyTorch pool in build_runtime().
+    for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ[variable] = "1"
+    args.diagnostic_dir = args.log_dir / (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + f"_{os.getpid()}"
+    )
+    args.diagnostic_dir.mkdir(parents=True, exist_ok=False)
+    file_handler = logging.FileHandler(args.diagnostic_dir / "training.log", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+    logger.info("Persistent diagnostics: %s", args.diagnostic_dir)
+    logger.info("Arguments: %s", vars(args))
     try:
-        runtime = build_runtime(parse_args(argv))
-        train(*runtime)
+        with raster_environment(args.gdal_cache_mb), RunDiagnostics(args.diagnostic_dir) as run_diagnostics:
+            diagnostics = run_diagnostics
+            runtime = build_runtime(args)
+            train(*runtime)
+            if args.smoke_batches:
+                logger.info("SMOKE TEST PASSED: training, validation and checkpoint completed")
+    except BaseException:
+        logger.exception("Training interrupted; diagnostics: %s", args.diagnostic_dir)
+        raise
     finally:
+        diagnostics = None
         if writer is not None:
             writer.close()
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
     return 0
 
 

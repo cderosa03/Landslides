@@ -56,7 +56,7 @@ class PSLandslideDataset(Dataset):
             "patch_size": self.patch_size,
             "use_post_only": self.use_post_only,
             "patch_ids": None if self.patch_ids is None else sorted(self.patch_ids),
-            "aux_channels": AUX_CHANNELS,
+            "aux_channels": list(AUX_CHANNELS),
             "aux_grid": "planet_aligned",
         }
         cache_key = sha256(

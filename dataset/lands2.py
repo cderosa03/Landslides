@@ -142,7 +142,7 @@ class PSLandslideSentinel2Dataset(Dataset):
                 # vengono invece gestiti con padding in _build_stack().
                 if REQUIRE_BOTH_TEMPORAL_SIDES and (not pre_dates or not post_dates):
                     self.excluded["incomplete_pre_post_temporal_pair"] += 1
-                    logger.info(
+                    logger.debug(
                         "Skipping %s/%s: incomplete temporal pair within %s days "
                         "(pre=%s, post=%s)",
                         event,
@@ -153,7 +153,7 @@ class PSLandslideSentinel2Dataset(Dataset):
                     )
                     continue
 
-                logger.info(
+                logger.debug(
                     "Selected Sentinel dates for %s/%s: pre=%s post=%s",
                     event,
                     patch_dir.name,
@@ -177,7 +177,7 @@ class PSLandslideSentinel2Dataset(Dataset):
     def _read(self, path: Path) -> torch.Tensor:
         """Read a GeoTIFF while converting only its explicit NoData to zero."""
         with rasterio.open(path) as src:
-            data = src.read(masked=True).astype(np.float32)
+            data = src.read(masked=True, out_dtype=np.float32)
         return torch.from_numpy(np.ma.filled(data, fill_value=0.0))
 
     def _load_frame(self, s2_dir: Path, date: str) -> torch.Tensor:
@@ -193,27 +193,24 @@ class PSLandslideSentinel2Dataset(Dataset):
         Restituisce (stack_tensor, valid_mask).
         """
         n = self.n_temporal
-        frames = []
-        valid  = []
-
-        for date in dates:
-            frames.append(self._load_frame(s2_dir, date))
-            valid.append(True)
-
-        # Padding con zeri se abbiamo meno di N_TEMPORAL date
-        if not frames:
+        if not dates:
             raise RuntimeError(
                 f"Nessun frame Sentinel-2 disponibile in {s2_dir}; "
                 "il campione deve avere almeno una data reale."
             )
-        ref_shape = frames[0].shape       # (10, H, W)
-
-        while len(frames) < n:
-            frames.append(torch.zeros(ref_shape, dtype=torch.float32))
-            valid.append(False)
-
-        stack      = torch.stack(frames, dim=0)                  # (N, 10, H, W)
-        valid_mask = torch.tensor(valid, dtype=torch.bool)       # (N,)
+        # Allocate once, instead of retaining all frames plus a second stacked
+        # copy and separate padding tensors for every sample in every worker.
+        first = self._load_frame(s2_dir, dates[0])
+        stack = torch.zeros((n, *first.shape), dtype=torch.float32)
+        stack[0].copy_(first)
+        del first
+        for index, date in enumerate(dates[1:], start=1):
+            frame = self._load_frame(s2_dir, date)
+            if frame.shape != stack.shape[1:]:
+                raise ValueError(f"Sentinel frame shape mismatch: {s2_dir / date}")
+            stack[index].copy_(frame)
+            del frame
+        valid_mask = torch.arange(n) < len(dates)
         return stack, valid_mask
 
     # ── Dataset API ──────────────────────────────────────────────────────
@@ -228,8 +225,8 @@ class PSLandslideSentinel2Dataset(Dataset):
 
         # Normalizzazione: DN Sentinel-2 → riflettanza [0, 1]
         if self.normalize:
-            pre  = pre  / 10000.0
-            post = post / 10000.0
+            pre.div_(10000.0)
+            post.div_(10000.0)
 
         return {
             "pre":        pre,         # (N_TEMPORAL, 10, H, W)
