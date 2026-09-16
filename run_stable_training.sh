@@ -8,10 +8,13 @@ case "$mode" in
     *) printf 'Uso: bash run_stable_training.sh smoke|train\n' >&2; exit 2 ;;
 esac
 
-python_bin=.venv/bin/python
-if [[ ! -x "$python_bin" ]]; then
-    python_bin=python
+if [[ -f .venv/bin/activate ]]; then
+    source .venv/bin/activate
+else
+    printf 'Errore: ambiente .venv non trovato in %s\n' "$PWD" >&2
+    exit 1
 fi
+python_bin=python
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export PYTHONUNBUFFERED=1
 

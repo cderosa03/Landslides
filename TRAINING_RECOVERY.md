@@ -31,7 +31,7 @@ I limiti della cache seguono [GDAL](https://gdal.org/en/stable/user/configoption
 
 ## Sul server, nella cartella del progetto
 
-Il launcher usa `.venv/bin/python` se presente e GPU 0 salvo un valore
+Il launcher attiva esplicitamente `.venv/bin/activate` e usa GPU 0 salvo un valore
 `CUDA_VISIBLE_DEVICES` gia impostato. Mantiene modello small, batch 8,
 training EmiliaRomagna2023 e validation Michoacan2022.
 
