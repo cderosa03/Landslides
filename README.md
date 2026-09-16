@@ -108,7 +108,18 @@ python train.py \
 ```
 
 Per un training completo aumentare `--epochs` e, se necessario, usare
-`--pos-weight` oppure `--balanced-sampling`. Per riprendere un esperimento:
+`--pos-weight` oppure `--balanced-sampling`.
+
+Per timeout su NFS o problemi di memoria, seguire la
+[procedura di verifica del training](TRAINING_RECOVERY.md):
+`bash run_stable_training.sh smoke` esegue una prova breve con cache GDAL
+limitata, worker `spawn` e log persistenti. Il timeout predefinito del
+DataLoader è 300 secondi; aumentarlo da solo non risolve un blocco.
+Con `--profile-batches 10` il log separa il tempo di caricamento da quello
+di forward/backward; `--num-workers 0` è utile per verificare se una lettura
+GeoTIFF si blocca, senza il timeout dei worker.
+
+Per riprendere un esperimento:
 
 ```bash
 python train.py --description "ripresa" \
