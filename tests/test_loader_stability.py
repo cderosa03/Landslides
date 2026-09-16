@@ -33,6 +33,37 @@ class RasterFixture(Dataset):
 
 
 class LoaderStabilityTests(unittest.TestCase):
+    def test_matched_training_epoch_keeps_full_validation_and_records_counts(self):
+        import json
+        with tempfile.TemporaryDirectory() as temporary:
+            previous = Path.cwd()
+            try:
+                os.chdir(temporary)
+                args = training.parse_args([
+                    "--description", "matched epoch fixture", "--match-train-to-val",
+                    "--num-workers", "0", "--batch-size", "2", "--val-batch-size", "2",
+                ])
+                with patch.object(training, "ChangeDetectionSwinUNet", return_value=torch.nn.Linear(2, 1)), \
+                     patch.object(training, "build_event_datasets", return_value=(None, None)), \
+                     patch.object(training, "MultiModalLandslideDataset", side_effect=[range(12), range(5)]), \
+                     patch.object(training.torch.cuda, "is_available", return_value=False):
+                    runtime = training.build_runtime(args)
+                train_loader, val_loader = runtime[1:3]
+                training_values = torch.cat(list(train_loader)).tolist()
+                self.assertEqual(len(training_values), 5)
+                self.assertEqual(len(set(training_values)), 5)
+                self.assertEqual(torch.cat(list(val_loader)).tolist(), list(range(5)))
+                self.assertEqual(len(train_loader.dataset), 12)
+                config = json.loads((training.EXPERIMENT_DIR / "config.json").read_text())
+                self.assertEqual(config["train_samples_available"], 12)
+                self.assertEqual(config["train_samples_per_epoch"], 5)
+                self.assertEqual(config["val_samples"], 5)
+                self.assertEqual(config["epochs"], 110)
+            finally:
+                if training.writer is not None:
+                    training.writer.close()
+                os.chdir(previous)
+
     @staticmethod
     def make_index_fixture(root):
         for index in range(1, 11):

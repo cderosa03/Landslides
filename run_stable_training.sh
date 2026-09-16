@@ -30,5 +30,6 @@ if [[ "$mode" == smoke ]]; then
     exec timeout --signal=INT --kill-after=30s 45m \
         "$python_bin" -u train.py "${args[@]}" --smoke-batches 20
 else
-    exec "$python_bin" -u train.py "${args[@]}"
+    exec "$python_bin" -u train.py "${args[@]}" \
+        --epochs 100 --warmup-epochs 10 --match-train-to-val --positive-fraction 0.5
 fi

@@ -5,8 +5,80 @@ from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
+import torch
+import rasterio
 from torch.utils.data import Sampler
 from tqdm import tqdm
+
+
+class EpochSubsetSampler(Sampler):
+    """Draw a fixed number without replacement, with an epoch-specific seed."""
+
+    def __init__(self, dataset, num_samples, seed=42):
+        self.dataset_size = len(dataset)
+        if not 1 <= num_samples <= self.dataset_size:
+            raise ValueError("num_samples must be between 1 and the dataset size")
+        self.num_samples = num_samples
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        return iter(torch.randperm(self.dataset_size, generator=generator)[:self.num_samples].tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
+class EpochStratifiedSampler(Sampler):
+    """Fixed-size epoch sample with a requested fraction of positive masks."""
+
+    def __init__(self, dataset, num_samples, positive_fraction=0.5, seed=42):
+        if not 0 < positive_fraction <= 1:
+            raise ValueError("positive_fraction must be in (0, 1]")
+        self.dataset = dataset
+        self.num_samples = min(num_samples, len(dataset))
+        self.positive_fraction = positive_fraction
+        self.seed = seed
+        self.epoch = 0
+        self.positive_indices = []
+        self.negative_indices = []
+        folders = getattr(getattr(dataset, "planet_ds", None), "folders", None)
+        if folders is not None and len(folders) == len(dataset):
+            for index, entry in enumerate(tqdm(folders, desc="Scanning training masks")):
+                with rasterio.open(entry["mask"]) as source:
+                    positive = bool(np.any(source.read(1, masked=True)))
+                (self.positive_indices if positive else self.negative_indices).append(index)
+        else:
+            for index in tqdm(range(len(dataset)), desc="Scanning training masks"):
+                (self.positive_indices if dataset[index]["mask"].any()
+                 else self.negative_indices).append(index)
+        if not self.positive_indices:
+            raise ValueError("No positive training masks found")
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        positive_count = min(len(self.positive_indices), round(self.num_samples * self.positive_fraction))
+        negative_count = self.num_samples - positive_count
+        if negative_count > len(self.negative_indices):
+            negative_count = len(self.negative_indices)
+            positive_count = self.num_samples - negative_count
+        positives = rng.choice(self.positive_indices, positive_count, replace=False)
+        negatives = rng.choice(self.negative_indices, negative_count, replace=False)
+        indices = np.concatenate([positives, negatives]).astype(np.int64)
+        rng.shuffle(indices)
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.num_samples
 
 
 class CachedSamplerBase(Sampler):

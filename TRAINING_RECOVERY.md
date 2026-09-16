@@ -60,10 +60,35 @@ Dopo una prova riuscita, il training completo si avvia con:
 nohup bash run_stable_training.sh train > "launch_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 ```
 
+Il launcher mantiene 110 epoche massime (10 warm-up + 100 principali) e
+l'early stopping esistente sulla AUPRC di validation, con patience 20.
+Usa `--match-train-to-val --positive-fraction 0.5`: ogni epoca estrae senza
+ripetizioni `min(numero training, numero validation)` campioni training,
+puntando al 50% di patch con frana e completando con patch senza frana.
+La selezione cambia con seed `42 + indice epoca`, quindi la stessa epoca
+ripresa da un checkpoint usa gli stessi indici. La validation resta completa
+e fissa. La scansione delle maschere legge direttamente i GeoTIFF `mask.tif`,
+senza caricare le serie Sentinel.
+Con 14.725 patch training e 6.679 validation, sono 6.679 campioni e 835 batch
+per fase con batch size 8. Tutte le patch training restano nel pool disponibile.
+
+Questa e una riduzione del numero di aggiornamenti per epoca, non un
+bilanciamento tra pixel/patch positivi e negativi. Per la tesi riportare
+campioni per epoca, criterio di selezione e aggiornamenti effettivi: 110 epoche
+limitate non equivalgono a 110 passaggi sull'intero training set. I conteggi
+sono salvati in config.json. La durata stimata dalla prova breve e circa
+1,8 ore/epoca, circa 8 giorni per 110 epoche, soggetta alle prestazioni NFS
+e da verificare sulla prima epoca completa. L'early stopping non garantisce
+un arresto anticipato.
+
+La scansione iniziale considera comunque l'intero pool training. Per usare
+epoche che coprono tutti i campioni, invocare train.py senza --match-train-to-val.
+
 Non ripetere il comando mentre un training e attivo. I risultati e i
 checkpoint restano nella nuova directory `exp/swinunet_128_*` indicata dal log.
 Per riprendere un esperimento completo usare `train.py --resume <directory>`
 con gli stessi eventi, modello, scheduler e iperparametri originali.
+Per riprendere questo protocollo includere anche --match-train-to-val.
 
 In caso di errore inviare la directory diagnostica del nuovo tentativo.
 Se il test fallisce ancora con spawn, una successiva prova con
