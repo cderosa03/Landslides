@@ -17,7 +17,7 @@ from dataset.landslides import PSLandslideDataset, REQUIRED_FILENAMES
 from dataset.lands2 import PSLandslideSentinel2Dataset
 from dataset.contracts import validate_multimodal_batch
 from dataset.multidata import MultiModalLandslideDataset
-from dataset.sampler import BalancedPosNegSampler
+from dataset.sampler import BalancedPosNegSampler, EpochStratifiedSampler
 
 from pathlib import Path
 from torch.nn import BCEWithLogitsLoss
@@ -131,6 +131,9 @@ def parse_args(argv=None):
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--pos-weight", type=float, default=1.0)
     parser.add_argument("--balanced-sampling", action="store_true")
+    parser.add_argument("--match-train-to-val", action="store_true")
+    parser.add_argument("--positive-fraction", type=float, default=0.5,
+                        help="Quota di patch con frana nel sottoinsieme training per epoca.")
     return parser.parse_args(argv)
 
 
@@ -413,6 +416,11 @@ def train(
         )
 
     for epoch in range(start_epoch, epochs):
+        if isinstance(train_loader.sampler, EpochStratifiedSampler):
+            train_loader.sampler.set_epoch(epoch)
+            logger.info("Epoch %d: %d/%d training samples; selection seed=%d",
+                        epoch + 1, len(train_loader.sampler), len(train_loader.dataset),
+                        train_loader.sampler.seed + epoch)
         model.train()
         total_loss, total_samples = 0.0, 0
         batch_contract_checked = False
@@ -672,6 +680,8 @@ def build_runtime(args):
         raise ValueError("Cache, thread e batch size devono essere >= 1")
     if args.smoke_batches < 0:
         raise ValueError("--smoke-batches deve essere >= 0")
+    if args.match_train_to_val and (args.smoke_batches or args.balanced_sampling):
+        raise ValueError("--match-train-to-val non si combina con --smoke-batches o --balanced-sampling")
     if args.smoke_batches:
         if args.resume or args.balanced_sampling:
             raise ValueError("La prova diagnostica non supporta --resume o --balanced-sampling")
@@ -731,16 +741,24 @@ def build_runtime(args):
         val_dataset = Subset(val_dataset, val_indices[:min(4, args.smoke_batches) * args.val_batch_size])
         logger.warning("DIAGNOSTIC ONLY: %d training samples, %d validation samples",
                        len(train_dataset), len(val_dataset))
-    train_sampler = (
-        BalancedPosNegSampler(train_dataset, args.patch_size)
-        if args.balanced_sampling
-        else None
-    )
+    if args.match_train_to_val:
+        train_sampler = EpochStratifiedSampler(
+            train_dataset, min(len(train_dataset), len(val_dataset)),
+            positive_fraction=args.positive_fraction, seed=SEED,
+        )
+    else:
+        train_sampler = (
+            BalancedPosNegSampler(train_dataset, args.patch_size)
+            if args.balanced_sampling else None
+        )
     logger.info(
         "Training sampler: %s; pos_weight=%s",
-        "balanced" if train_sampler else "shuffle",
+        "epoch_subset" if args.match_train_to_val else ("balanced" if train_sampler else "shuffle"),
         args.pos_weight,
     )
+    logger.info("Samples: training available=%d, training per epoch=%d, validation=%d",
+                len(train_dataset), len(train_sampler) if train_sampler is not None else len(train_dataset),
+                len(val_dataset))
     loader_options = {
         "num_workers": args.num_workers,
         "worker_init_fn": partial(seed_worker, gdal_cache_mb=args.gdal_cache_mb,
@@ -807,6 +825,12 @@ def build_runtime(args):
         "profile_batches": args.profile_batches,
         "pos_weight": args.pos_weight,
         "balanced_sampling": args.balanced_sampling,
+        "match_train_to_val": args.match_train_to_val,
+        "train_samples_available": len(train_dataset),
+        "train_samples_per_epoch": len(train_sampler) if train_sampler is not None else len(train_dataset),
+        "val_samples": len(val_dataset),
+        "positive_fraction": args.positive_fraction,
+        "epoch_selection_seed": "seed + zero_based_epoch" if args.match_train_to_val else None,
         "seed": SEED,
     }
     (EXPERIMENT_DIR / "config.json").write_text(
