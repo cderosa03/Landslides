@@ -34,5 +34,5 @@ if [[ "$mode" == smoke ]]; then
         "$python_bin" -u train.py "${args[@]}" --smoke-batches 20
 else
     exec "$python_bin" -u train.py "${args[@]}" \
-        --epochs 100 --warmup-epochs 10 --match-train-to-val --positive-fraction 0.5
+        --epochs 100 --warmup-epochs 10 --match-train-to-val
 fi

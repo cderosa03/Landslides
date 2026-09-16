@@ -62,13 +62,12 @@ nohup bash run_stable_training.sh train > "launch_$(date +%Y%m%d_%H%M%S).log" 2>
 
 Il launcher mantiene 110 epoche massime (10 warm-up + 100 principali) e
 l'early stopping esistente sulla AUPRC di validation, con patience 20.
-Usa `--match-train-to-val --positive-fraction 0.5`: ogni epoca estrae senza
-ripetizioni `min(numero training, numero validation)` campioni training,
-puntando al 50% di patch con frana e completando con patch senza frana.
+Usa `--match-train-to-val`: ogni epoca estrae casualmente senza ripetizioni
+`min(numero training, numero validation)` campioni dal pool di patch già
+allineate.
 La selezione cambia con seed `42 + indice epoca`, quindi la stessa epoca
 ripresa da un checkpoint usa gli stessi indici. La validation resta completa
-e fissa. La scansione delle maschere legge direttamente i GeoTIFF `mask.tif`,
-senza caricare le serie Sentinel.
+e fissa. Non viene eseguita una scansione preventiva dei `mask.tif`.
 Con 14.725 patch training e 6.679 validation, sono 6.679 campioni e 835 batch
 per fase con batch size 8. Tutte le patch training restano nel pool disponibile.
 

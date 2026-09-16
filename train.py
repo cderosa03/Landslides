@@ -17,7 +17,7 @@ from dataset.landslides import PSLandslideDataset, REQUIRED_FILENAMES
 from dataset.lands2 import PSLandslideSentinel2Dataset
 from dataset.contracts import validate_multimodal_batch
 from dataset.multidata import MultiModalLandslideDataset
-from dataset.sampler import BalancedPosNegSampler, EpochStratifiedSampler
+from dataset.sampler import BalancedPosNegSampler, EpochSubsetSampler
 
 from pathlib import Path
 from torch.nn import BCEWithLogitsLoss
@@ -416,7 +416,7 @@ def train(
         )
 
     for epoch in range(start_epoch, epochs):
-        if isinstance(train_loader.sampler, EpochStratifiedSampler):
+        if isinstance(train_loader.sampler, EpochSubsetSampler):
             train_loader.sampler.set_epoch(epoch)
             logger.info("Epoch %d: %d/%d training samples; selection seed=%d",
                         epoch + 1, len(train_loader.sampler), len(train_loader.dataset),
@@ -742,9 +742,8 @@ def build_runtime(args):
         logger.warning("DIAGNOSTIC ONLY: %d training samples, %d validation samples",
                        len(train_dataset), len(val_dataset))
     if args.match_train_to_val:
-        train_sampler = EpochStratifiedSampler(
-            train_dataset, min(len(train_dataset), len(val_dataset)),
-            positive_fraction=args.positive_fraction, seed=SEED,
+        train_sampler = EpochSubsetSampler(
+            train_dataset, min(len(train_dataset), len(val_dataset)), seed=SEED,
         )
     else:
         train_sampler = (
