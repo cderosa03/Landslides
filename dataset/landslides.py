@@ -16,6 +16,8 @@ DTM_FILENAME = "dem.tif"
 SLOPE_FILENAME = "slope.tif"
 ASPECT_FILENAME = "aspect.tif"
 MASK_FILENAME = "mask.tif"
+REQUIRED_FILENAMES = (PRE_FILENAME, POST_FILENAME, DTM_FILENAME,
+                      SLOPE_FILENAME, ASPECT_FILENAME, MASK_FILENAME)
 
 # AUX use rasters aligned to the Planet patch grid.
 AUX_CHANNELS = ("dem_asinh", "slope_unit", "aspect_sin", "aspect_cos")
@@ -92,10 +94,9 @@ class PSLandslideDataset(Dataset):
             if not event_dir.exists():
                 continue  # Skip missing event directories
 
-            patch_folders = sorted(
-                p for p in event_dir.iterdir()
-                if p.is_dir() and (self.patch_ids is None or p.name in self.patch_ids)
-            )
+            candidates = (event_dir.iterdir() if self.patch_ids is None else
+                          (event_dir / name for name in sorted(self.patch_ids)))
+            patch_folders = sorted(p for p in candidates if p.is_dir())
 
             # Iterate over patch folders with nested progress bar
             for patch_folder in tqdm(

@@ -13,7 +13,7 @@ import torch
 import torch.optim as optim
 
 from models.swinunet import ChangeDetectionSwinUNet
-from dataset.landslides import PSLandslideDataset
+from dataset.landslides import PSLandslideDataset, REQUIRED_FILENAMES
 from dataset.lands2 import PSLandslideSentinel2Dataset
 from dataset.contracts import validate_multimodal_batch
 from dataset.multidata import MultiModalLandslideDataset
@@ -638,6 +638,25 @@ def train(
     )
 
 
+def build_event_datasets(args, events, sample_limit=None):
+    if sample_limit is not None:
+        logger.info("Prova breve %s: ricerca di massimo %d coppie valide", events, sample_limit)
+        sentinel = PSLandslideSentinel2Dataset(
+            args.dataset_root, events, apply_transform=False,
+            sample_limit=sample_limit, required_files=REQUIRED_FILENAMES, index_seed=SEED,
+        )
+        planet = PSLandslideDataset(
+            args.dataset_root, events, patch_size=args.patch_size, apply_transform=False,
+            patch_ids={sample["patch_id"] for sample in sentinel.samples},
+        )
+    else:
+        planet = PSLandslideDataset(
+            args.dataset_root, events, patch_size=args.patch_size, apply_transform=False,
+        )
+        sentinel = PSLandslideSentinel2Dataset(args.dataset_root, events, apply_transform=False)
+    return planet, sentinel
+
+
 def build_runtime(args):
     """Create training objects after CLI parsing, never at module import time."""
     global EXPERIMENT_DIR, RUN_CONFIG, START_EARLY_STOPPING_FROM_EPOCH
@@ -689,23 +708,13 @@ def build_runtime(args):
     else:
         scheduler = cosine
 
-    planet_train = PSLandslideDataset(
-        args.dataset_root,
-        args.train_events,
-        patch_size=args.patch_size,
-        apply_transform=False,
+    planet_train, s2_train = build_event_datasets(
+        args, args.train_events,
+        args.smoke_batches * args.batch_size if args.smoke_batches else None,
     )
-    planet_val = PSLandslideDataset(
-        args.dataset_root,
-        args.val_events,
-        patch_size=args.patch_size,
-        apply_transform=False,
-    )
-    s2_train = PSLandslideSentinel2Dataset(
-        args.dataset_root, args.train_events, apply_transform=False
-    )
-    s2_val = PSLandslideSentinel2Dataset(
-        args.dataset_root, args.val_events, apply_transform=False
+    planet_val, s2_val = build_event_datasets(
+        args, args.val_events,
+        min(4, args.smoke_batches) * args.val_batch_size if args.smoke_batches else None,
     )
     train_dataset = MultiModalLandslideDataset(
         planet_train, s2_train, apply_transform=True
