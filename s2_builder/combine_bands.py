@@ -1,8 +1,8 @@
-import elevation
-import geopandas as gpd
 import logging
 import numpy as np
 import os
+import argparse
+import csv
 import rasterio
 
 from pathlib import Path
@@ -21,8 +21,8 @@ logging.basicConfig(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-IMAGES_PATH = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
-ANNOTATIONS_PATH = Path(os.getenv("INVENTORIES_PATH", PROJECT_ROOT / "inventories"))
+IMAGES_PATH = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Landslides" / "Sentinel" / "images"))
+ANNOTATIONS_PATH = Path(os.getenv("INVENTORIES_PATH", PROJECT_ROOT / "Landslides" / "inventories"))
 PRODUCT_LEVEL = "MSIL2A"
 
 PRODUCTS_10m = ["B02_10m", "B03_10m", "B04_10m", "B08_10m"]
@@ -57,6 +57,7 @@ def transform_bounds(raster_crs, raster_bounds, target_crs="EPSG:4326"):
 def download_and_clip_dtm(bounds, output_file):
     """Download and clip the DTM using the elevation library."""
     logging.info(f"Clipping DTM for bounds: {bounds}")
+    import elevation
     elevation.clip(bounds=bounds, output=output_file.resolve())
     elevation.clean()
     logging.info(f"DTM clipped and saved to {output_file}")
@@ -114,6 +115,7 @@ def download_dtm(raster_crs, raster_bounds, dtm_filename):
 
 def clip_raster(raster_src, shapefile_path):
     """Clip raster using a shapefile and return the clipped image and metadata."""
+    import geopandas as gpd
     shapefile = gpd.read_file(shapefile_path, layer="area")
     shapes = [
         feature["geometry"] for feature in shapefile.__geo_interface__["features"]
@@ -227,6 +229,7 @@ def combine_bands(
 
 def save_annotation(shapefile_path, meta, output_path):
     """Rasterize polygon shapefile."""
+    import geopandas as gpd
     shapefile = gpd.read_file(shapefile_path, layer="landslides")
     shapes = ((geom, 1) for geom in shapefile.geometry)
 
@@ -245,27 +248,6 @@ def save_annotation(shapefile_path, meta, output_path):
         dst.write(binary_raster, 1)
 
     logging.info(f"Annotation raster saved as {output_path}")
-
-
-def process_tile_level(tile, product_level, gpkg_path):
-    level_dir = tile / product_level
-    if not level_dir.exists():
-        return
-
-    date_dirs = sorted(
-        d for d in level_dir.iterdir() if d.is_dir() and "_MSIL2A_" in d.name
-    )
-    out_tile_dir = tile.parent / "combined" / tile.name / product_level
-
-    for date_dir in date_dirs:
-        date_str = date_dir.name.split("_")[2][:8]
-        out_date_dir = out_tile_dir / date_str
-        out_date_dir.mkdir(parents=True, exist_ok=True)
-
-        process_band_groups(date_dir, out_date_dir, tile.name, gpkg_path)
-        save_sen2cor_mask(date_dir, out_date_dir)
-
-        generate_dtm_and_annotation(date_str, out_date_dir, gpkg_path, out_tile_dir)
 
 
 def find_l2a_band(date_dir, band, resolution):
@@ -314,7 +296,7 @@ def process_band_groups(date_dir, out_dir, tile_name, gpkg_path):
 def save_sen2cor_mask(date_dir, out_dir):
     scl_file = next(date_dir.rglob("*_SCL_20m.jp2"), None)
     if not scl_file:
-        return
+        raise FileNotFoundError(f"Missing SCL_20m JP2 in {date_dir}")
 
     mask_path = out_dir / "sen2cor.tif"
     if mask_path.exists():
@@ -362,20 +344,84 @@ def generate_dtm_and_annotation(date_str, out_dir, gpkg_path, out_tile_dir):
         logging.info("Annotation already exists.")
 
 
-def process_inventory(inventory_path):
-    gpkg_path = ANNOTATIONS_PATH / f"{inventory_path.name}.gpkg"
-    if not gpkg_path.exists():
-        logging.warning(f"No annotation file found for: {inventory_path.name}")
-        return
 
-    for tile in inventory_path.glob("T[0-9][0-9]*"):
-        process_tile_level(tile, PRODUCT_LEVEL, gpkg_path)
+
+def parse_cli():
+    parser = argparse.ArgumentParser(description="Build combined Sentinel L2A products in a separate staging root")
+    parser.add_argument("--images-root", type=Path, default=IMAGES_PATH)
+    parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "s2_combined_candidate")
+    parser.add_argument("--events", nargs="+", default=["Lombok2018", "Philippines2019", "Michoacan2022", "EmiliaRomagna2023"])
+    parser.add_argument("--max-dates", type=int, default=0, help="Limit number of products for a test; 0 = all")
+    parser.add_argument("--apply", action="store_true", help="Write output; otherwise dry-run")
+    parser.add_argument("--report", type=Path, default=Path("s2_combined_build_report.csv"))
+    args = parser.parse_args()
+    if args.max_dates < 0:
+        parser.error("--max-dates must be >= 0")
+    inp, out = args.images_root.resolve(), args.output_root.resolve()
+    if out == inp or inp in out.parents or out in inp.parents:
+        parser.error("--output-root must be separate from --images-root")
+    return args
+
+
+def main():
+    args = parse_cli()
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    seen_dates = set()
+    with args.report.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["event", "tile", "date", "status", "details"])
+        for event in args.events:
+            event_dir = args.images_root / event
+            if not event_dir.is_dir():
+                writer.writerow([event, "", "", "missing_event", str(event_dir)])
+                continue
+            gpkg = ANNOTATIONS_PATH / f"{event}.gpkg"
+            if not gpkg.is_file():
+                logging.warning("No annotation geopackage: %s; band clipping will be skipped", gpkg)
+            for tile_dir in sorted(event_dir.glob("T[0-9][0-9]*")):
+                source_level = tile_dir / PRODUCT_LEVEL
+                if not source_level.is_dir():
+                    continue
+                for product in sorted(source_level.glob("*_MSIL2A_*.SAFE")):
+                    if args.max_dates and processed >= args.max_dates:
+                        break
+                    if not product.is_dir():
+                        continue
+                    date_str = product.name.split("_")[2][:8]
+                    out_dir = args.output_root / event / tile_dir.name / PRODUCT_LEVEL / date_str
+                    key = (event, tile_dir.name, date_str)
+                    if key in seen_dates:
+                        writer.writerow([event, tile_dir.name, date_str, "duplicate_product_date_manual_review", product.name])
+                        continue
+                    seen_dates.add(key)
+                    trio = (out_dir / f"{date_str}_10m.tif", out_dir / f"{date_str}_20m.tif", out_dir / "sen2cor.tif")
+                    if all(f.is_file() and f.stat().st_size > 0 for f in trio):
+                        writer.writerow([event, tile_dir.name, date_str, "already_complete", ""])
+                    elif any(f.exists() for f in trio):
+                        writer.writerow([event, tile_dir.name, date_str, "partial_output_manual_review", str(out_dir)])
+                    elif not args.apply:
+                        writer.writerow([event, tile_dir.name, date_str, "would_generate", ""])
+                    else:
+                        try:
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            process_band_groups(product, out_dir, tile_dir.name, gpkg if gpkg.is_file() else None)
+                            save_sen2cor_mask(product, out_dir)
+                            if not all(f.is_file() and f.stat().st_size > 0 for f in trio):
+                                raise RuntimeError("Incomplete 10m/20m/SCL output")
+                            writer.writerow([event, tile_dir.name, date_str, "generated", ""])
+                        except Exception as exc:
+                            logging.exception("Failed %s %s %s", event, tile_dir.name, date_str)
+                            writer.writerow([event, tile_dir.name, date_str, "error", str(exc)])
+                    processed += 1
+                    stream.flush()
+                if args.max_dates and processed >= args.max_dates:
+                    break
+            if args.max_dates and processed >= args.max_dates:
+                break
+    logging.info("Processed %d products; report %s", processed, args.report)
+    logging.warning("Existing output directories are never removed; validate outputs before promoting")
 
 
 if __name__ == "__main__":
-    for inventory in IMAGES_PATH.iterdir():
-        if inventory.is_dir():
-            logging.info(f"Processing: {inventory.name}")
-            process_inventory(inventory)
-
-    logging.info("All inventories processed.")
+    main()

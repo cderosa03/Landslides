@@ -2,6 +2,10 @@ from collections import defaultdict
 import logging
 import numpy as np
 import os
+import argparse
+import csv
+import shutil
+import tempfile
 from pathlib import Path
 from shapely.geometry import box
 import rasterio
@@ -16,9 +20,10 @@ logging.basicConfig(
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "PlanetScope" / "patches"))
-S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Sentinel" / "images"))
+PS_BASE = Path(os.getenv("PS_PATCHES_PATH", PROJECT_ROOT / "Landslides" / "PlanetScope" / "patches"))
+S2_BASE = Path(os.getenv("S2_IMAGES_PATH", PROJECT_ROOT / "Landslides" / "Sentinel" / "images"))
 S2_PRODUCT_LEVEL = "MSIL2A"
+S2_COMBINED_ROOT = None  # optional isolated combined output
 MIN_VALID_COVERAGE = float(os.getenv("S2_MIN_VALID_COVERAGE", "0.95"))
 INVALID_SCL_CLASSES = frozenset(
     int(value)
@@ -63,7 +68,7 @@ def get_patch_bounds_utm(patch_ds: rasterio.io.DatasetReader, utm_epsg: int):
 
 def find_overlapping_s2_tiles(event: str, patch_ds: rasterio.io.DatasetReader) -> list[Path]:
     """Find Sentinel-2 tiles overlapping a PlanetScope patch using UTM/MGRS"""
-    s2_event_dir = S2_BASE / event / "combined"
+    s2_event_dir = (S2_COMBINED_ROOT / event) if S2_COMBINED_ROOT is not None else (S2_BASE / event / "combined")
     if not s2_event_dir.exists():
         logging.warning(f"No Sentinel-2 directory found for event {event}")
         return []
@@ -336,85 +341,135 @@ def group_images_by_date(tile_dirs):
     return dict(sorted(images_by_date.items()))
 
 
-def process_patch(patch_dir: Path, event: str):
-    pre_path = patch_dir / "pre.tif"
-    if not pre_path.exists():
-        logging.warning(f"Missing pre.tif for patch {patch_dir.name}")
+
+
+def parse_cli():
+    parser = argparse.ArgumentParser(description="Generate clean Sentinel-2 patches in a separate output directory")
+    parser.add_argument("--patches-root", type=Path, default=PS_BASE)
+    parser.add_argument("--s2-images-root", type=Path, default=S2_BASE)
+    parser.add_argument("--s2-combined-root", type=Path, default=None, help="Use staged combined output (event/tile/MSIL2A/date) instead of original combined/")
+    parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "s2_patches_candidate")
+    parser.add_argument("--events", nargs="+", default=EVENTS)
+    parser.add_argument("--limit-patches", type=int, default=0, help="0 means all")
+    parser.add_argument("--apply", action="store_true", help="Actually create outputs; otherwise dry-run")
+    parser.add_argument("--resume", action="store_true", help="Skip complete date outputs from prior runs")
+    parser.add_argument("--min-valid-coverage", type=float, default=MIN_VALID_COVERAGE)
+    parser.add_argument("--report", type=Path, default=Path("s2_patches_build_report.csv"))
+    args = parser.parse_args()
+    if not 0 <= args.min_valid_coverage <= 1:
+        parser.error("--min-valid-coverage must be in [0,1]")
+    if args.limit_patches < 0:
+        parser.error("--limit-patches must be >= 0")
+    # Never write inside existing PlanetScope patch tree.
+    src = args.patches_root.resolve()
+    out = args.output_root.resolve()
+    if out == src or src in out.parents or out in src.parents:
+        parser.error("--output-root must be separate from --patches-root")
+    return args
+
+
+def complete_date(folder):
+    paths = [folder / name for name in ("s2_10m.tif", "s2_20m.tif", "s2_valid.tif")]
+    if not all(p.is_file() and p.stat().st_size > 0 for p in paths):
+        return False
+    try:
+        with rasterio.open(paths[0]) as a, rasterio.open(paths[1]) as b, rasterio.open(paths[2]) as v:
+            return (a.crs == b.crs == v.crs and a.transform == b.transform == v.transform
+                    and a.width == b.width == v.width and a.height == b.height == v.height
+                    and v.count == 1)
+    except Exception:
+        return False
+
+
+def write_date_atomically(folder, image10, image20, valid, patch_ds, metadata):
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".building_", dir=folder.parent))
+    try:
+        write_patch(temp_dir / "s2_10m.tif", image10, patch_ds, metadata)
+        write_patch(temp_dir / "s2_20m.tif", image20, patch_ds, metadata)
+        write_coverage(temp_dir / "s2_valid.tif", valid, patch_ds, metadata)
+        if not complete_date(temp_dir):
+            raise RuntimeError(f"Incomplete output: {temp_dir}")
+        if folder.exists():
+            raise FileExistsError(f"Output already exists: {folder}; choose a clean --output-root")
+        temp_dir.rename(folder)
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+
+
+def process_one_patch(patch_dir, event, args, report_writer):
+    reference = patch_dir / "pre.tif"
+    if not reference.is_file():
+        report_writer.writerow([event, patch_dir.name, "", "missing_pre", ""])
         return
-
-    with rasterio.open(pre_path) as patch_ds:
-        overlapping_tiles = find_overlapping_s2_tiles(event, patch_ds)
-
-        if not overlapping_tiles:
-            logging.warning(f"No overlapping Sentinel-2 tiles found for patch {patch_dir.name}")
+    with rasterio.open(reference) as patch_ds:
+        tiles = find_overlapping_s2_tiles(event, patch_ds)
+        if not tiles:
+            report_writer.writerow([event, patch_dir.name, "", "no_overlapping_tiles", ""])
             return
-
-        s2_count = 0
-        for date_str, image_paths in group_images_by_date(overlapping_tiles).items():
-            s2_10m_patch, s2_20m_patch, valid = mosaic_s2_images(
-                image_paths, patch_ds
-            )
-            if s2_10m_patch is None:
+        dates = group_images_by_date(tiles)
+        for date_str, sources in dates.items():
+            target = args.output_root / event / patch_dir.name / "s2" / date_str
+            if args.resume and complete_date(target):
+                report_writer.writerow([event, patch_dir.name, date_str, "already_complete", ""])
                 continue
-
-            coverage = float(valid.mean())
-            invalid_fraction = 1.0 - coverage
-            if coverage < MIN_VALID_COVERAGE:
-                logging.warning(
-                    "Skipping %s/%s on %s: valid %.2f%%, invalid %.2f%%",
-                    event,
-                    patch_dir.name,
-                    date_str,
-                    coverage * 100,
-                    invalid_fraction * 100,
-                )
+            # Never silently overwrite partial or old output.
+            if target.exists():
+                report_writer.writerow([event, patch_dir.name, date_str, "output_exists", ""])
                 continue
+            if not args.apply:
+                report_writer.writerow([event, patch_dir.name, date_str, "would_generate", ""])
+                continue
+            try:
+                image10, image20, valid = mosaic_s2_images(sources, patch_ds)
+                if image10 is None:
+                    report_writer.writerow([event, patch_dir.name, date_str, "no_usable_source", ""])
+                    continue
+                coverage = float(valid.mean())
+                if coverage < args.min_valid_coverage:
+                    report_writer.writerow([event, patch_dir.name, date_str, "low_coverage", f"{coverage:.6f}"])
+                    continue
+                metadata = {
+                    **mosaic_metadata(date_str, sources),
+                    "s2_valid_coverage": f"{coverage:.6f}",
+                    "s2_invalid_fraction": f"{1 - coverage:.6f}",
+                    "s2_invalid_scl_classes": ",".join(map(str, sorted(INVALID_SCL_CLASSES))),
+                }
+                write_date_atomically(target, image10, image20, valid, patch_ds, metadata)
+                report_writer.writerow([event, patch_dir.name, date_str, "generated", f"{coverage:.6f}"])
+            except Exception as exc:
+                logging.exception("Failed %s/%s/%s", event, patch_dir.name, date_str)
+                report_writer.writerow([event, patch_dir.name, date_str, "error", str(exc)])
 
-            date_dir = patch_dir / "s2" / date_str
-            date_dir.mkdir(parents=True, exist_ok=True)
-            metadata = {
-                **mosaic_metadata(date_str, image_paths),
-                "s2_valid_coverage": f"{coverage:.6f}",
-                "s2_invalid_fraction": f"{invalid_fraction:.6f}",
-                "s2_invalid_scl_classes": ",".join(map(str, sorted(INVALID_SCL_CLASSES))),
-            }
-            write_patch(date_dir / "s2_10m.tif", s2_10m_patch, patch_ds, metadata)
-            write_patch(date_dir / "s2_20m.tif", s2_20m_patch, patch_ds, metadata)
-            write_coverage(date_dir / "s2_valid.tif", valid, patch_ds, metadata)
-            s2_count += 1
-            logging.info(
-                "Saved Sentinel-2 mosaic for %s from tiles %s (coverage %.2f%%)",
-                date_str,
-                metadata["s2_source_tiles"],
-                coverage * 100,
-            )
 
-        if s2_count == 0:
-            logging.warning(f"No Sentinel-2 data extracted for patch {patch_dir.name}")
-        else:
-            logging.info(f"Extracted {s2_count} Sentinel-2 images for patch {patch_dir.name}")
-
-
-def process_event(event: str):
-    ps_event_dir = PS_BASE / event
-    if not ps_event_dir.exists():
-        logging.warning(f"PlanetScope directory not found: {ps_event_dir}")
-        return
-
-    patch_dirs = [d for d in ps_event_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-    logging.info(f"Processing {len(patch_dirs)} patches for event {event}")
-
-    for patch_dir in patch_dirs:
-        process_patch(patch_dir, event)
-
-    logging.info(f"Completed processing event {event}")
+def main():
+    args = parse_cli()
+    global S2_BASE, S2_COMBINED_ROOT
+    S2_BASE = args.s2_images_root
+    S2_COMBINED_ROOT = args.s2_combined_root
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    # Flush incrementally; errors never destroy existing patch data.
+    with args.report.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["event", "patch_id", "date", "status", "coverage_or_error"])
+        for event in args.events:
+            event_dir = args.patches_root / event
+            if not event_dir.is_dir():
+                logging.error("Missing event directory %s", event_dir)
+                writer.writerow([event, "", "", "missing_event_directory", str(event_dir)])
+                continue
+            patches = sorted((p for p in event_dir.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: int(p.name))
+            if args.limit_patches:
+                patches = patches[:args.limit_patches]
+            logging.info("%s: %d patches (%s)", event, len(patches), "APPLY" if args.apply else "DRY RUN")
+            for index, patch in enumerate(patches, 1):
+                process_one_patch(patch, event, args, writer)
+                stream.flush()
+                if index % 100 == 0 or index == len(patches):
+                    logging.info("%s: %d/%d patches", event, index, len(patches))
+    logging.info("Report saved: %s", args.report)
 
 
 if __name__ == "__main__":
-    for ev in EVENTS:
-        logging.info("=" * 60)
-        logging.info(f"Processing event: {ev}")
-        logging.info("=" * 60)
-        process_event(ev)
-
-    logging.info("All events processed successfully.")
+    main()
