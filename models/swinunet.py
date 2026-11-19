@@ -215,35 +215,39 @@ class ChangeDetectionSwinUNet(nn.Module):
 
     def __init__(
         self, img_size=128, num_classes=1, model_size="small", aux_channels=4,
-        pretrained=True,
+        pretrained=True, use_s2=True,
     ):
         super().__init__()
         self.img_size = img_size
+        # use_s2=False: ablazione senza Sentinel-2. Il ramo S2 non viene creato
+        # e la fusione usa solo la differenza PlanetScope e le feature AUX.
+        self.use_s2 = use_s2
 
         model_name = swinv2_size[model_size]
         num_heads  = swinv2_num_heads_dict[model_name]
         out_indices = (0, 1, 2, 3)
 
-        # ── Adattatore S2: 10 bande → 3 canali compatibili con Swin ─────
-        self.s2_adapter = nn.Conv2d(10, 3, kernel_size=1, bias=False)
+        if use_s2:
+            # ── Adattatore S2: 10 bande → 3 canali compatibili con Swin ─────
+            self.s2_adapter = nn.Conv2d(10, 3, kernel_size=1, bias=False)
 
-        # ── Encoder separati per i due sensori ───────────────────────────
-        self.s2_encoder = SwinEncoder(
-            model_name=model_name, img_size=img_size,
-            in_chans=3, pretrained=pretrained, out_indices=out_indices,
-        )
+            # ── Encoder separati per i due sensori ───────────────────────────
+            self.s2_encoder = SwinEncoder(
+                model_name=model_name, img_size=img_size,
+                in_chans=3, pretrained=pretrained, out_indices=out_indices,
+            )
         self.planet_encoder = SwinEncoder(
             model_name=model_name, img_size=img_size,
             in_chans=3, pretrained=pretrained, out_indices=out_indices,
         )
 
-        enc_channels = self.s2_encoder.out_channels  # [96, 192, 384, 768]
+        enc_channels = self.planet_encoder.out_channels  # [96, 192, 384, 768]
         self.aux_channels = aux_channels
         self.aux_encoder = AuxPyramidEncoder(aux_channels, enc_channels)
 
         # ── Moduli di fusione (uno per stage) ────────────────────────────
         self.fusion_stages = nn.ModuleList([
-            DiffFusionModule(3 * ch, ch) for ch in enc_channels
+            DiffFusionModule((3 if use_s2 else 2) * ch, ch) for ch in enc_channels
         ])
 
         # ── Decoder Transformer ──────────────────────────────────────────
@@ -287,6 +291,38 @@ class ChangeDetectionSwinUNet(nn.Module):
         aux             : (B, 4, H, W)      contesto topografico normalizzato
         valid_t1/t2    : (B, T) bool        maschera frame validi (None = tutti validi)
         """
+        if self.use_s2:
+            s2_f1, s2_f2 = self._encode_s2(s2_t1, s2_t2, valid_t1, valid_t2)
+
+        # ── Encoding PlanetScope (singola immagine, invariato) ───────────
+        p_f1 = self.planet_encoder(p_t1)   # list[4 × (B, C, H, W)]
+        p_f2 = self.planet_encoder(p_t2)
+        if aux.ndim != 4 or aux.shape[1] != self.aux_channels:
+            raise ValueError(
+                f"aux atteso (B,{self.aux_channels},H,W), ricevuto {tuple(aux.shape)}"
+            )
+        aux_features = self.aux_encoder(aux)
+
+        # ── Fusione: differenza S2 (se attivo) + differenza Planet + AUX ──
+        fused = []
+        for i in range(len(p_f1)):
+            diff_p  = p_f2[i]  - p_f1[i]           # cambiamento Planet
+            if aux_features[i].shape != diff_p.shape:
+                raise ValueError(
+                    f"AUX stage {i} non allineato: {tuple(aux_features[i].shape)} vs "
+                    f"{tuple(diff_p.shape)}"
+                )
+            parts = [diff_p, aux_features[i]]
+            if self.use_s2:
+                parts.insert(0, s2_f2[i] - s2_f1[i])   # cambiamento S2
+            f = torch.cat(parts, dim=1)
+            fused.append(self.fusion_stages[i](f))   # (B, C, H, W)
+
+        # ── Decoder → logit per pixel ─────────────────────────────────────
+        return self.decoder(fused)   # (B, 1, H, W)
+
+    def _encode_s2(self, s2_t1, s2_t2, valid_t1, valid_t2):
+        """Codifica le serie S2 pre/post e restituisce le feature mediate."""
         B, T, C, H, W = s2_t1.shape
 
         # ── Default: tutti i frame considerati validi ────────────────────
@@ -308,28 +344,4 @@ class ChangeDetectionSwinUNet(nn.Module):
         # ── Media temporale pesata (ignora frame di padding) ─────────────
         s2_f1 = self._temporal_mean(s2_f1_flat, B, T, valid_t1)  # list[4 × (B,C,H,W)]
         s2_f2 = self._temporal_mean(s2_f2_flat, B, T, valid_t2)
-
-        # ── Encoding PlanetScope (singola immagine, invariato) ───────────
-        p_f1 = self.planet_encoder(p_t1)   # list[4 × (B, C, H, W)]
-        p_f2 = self.planet_encoder(p_t2)
-        if aux.ndim != 4 or aux.shape[1] != self.aux_channels:
-            raise ValueError(
-                f"aux atteso (B,{self.aux_channels},H,W), ricevuto {tuple(aux.shape)}"
-            )
-        aux_features = self.aux_encoder(aux)
-
-        # ── Fusione: differenza S2 + differenza Planet → DiffFusionModule ─
-        fused = []
-        for i in range(len(s2_f1)):
-            diff_s2 = s2_f2[i] - s2_f1[i]          # cambiamento S2
-            diff_p  = p_f2[i]  - p_f1[i]           # cambiamento Planet
-            if aux_features[i].shape != diff_p.shape:
-                raise ValueError(
-                    f"AUX stage {i} non allineato: {tuple(aux_features[i].shape)} vs "
-                    f"{tuple(diff_p.shape)}"
-                )
-            f = torch.cat([diff_s2, diff_p, aux_features[i]], dim=1)
-            fused.append(self.fusion_stages[i](f))   # (B, C, H, W)
-
-        # ── Decoder → logit per pixel ─────────────────────────────────────
-        return self.decoder(fused)   # (B, 1, H, W)
+        return s2_f1, s2_f2

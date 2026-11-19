@@ -132,6 +132,11 @@ def parse_args(argv=None):
     parser.add_argument("--pos-weight", type=float, default=1.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--match-train-to-val", action="store_true")
+    parser.add_argument(
+        "--no-s2", action="store_true",
+        help="Ablazione: modello solo PlanetScope + AUX. Le patch restano le stesse "
+             "del training multimodale (serve comunque una coppia S2 pre/post valida).",
+    )
     parser.add_argument("--positive-fraction", type=float, default=0.5,
                         help="Quota di patch con frana nel sottoinsieme training per epoca.")
     return parser.parse_args(argv)
@@ -698,6 +703,7 @@ def build_runtime(args):
     model = ChangeDetectionSwinUNet(
         model_size=args.model_size,
         img_size=args.patch_size,
+        use_s2=not args.no_s2,
     ).to(device)
     criterion = BCEWithLogitsLoss(
         pos_weight=torch.tensor([args.pos_weight], dtype=torch.float32, device=device)
@@ -825,6 +831,7 @@ def build_runtime(args):
         "pos_weight": args.pos_weight,
         "balanced_sampling": args.balanced_sampling,
         "match_train_to_val": args.match_train_to_val,
+        "use_s2": not args.no_s2,
         "train_samples_available": len(train_dataset),
         "train_samples_per_epoch": len(train_sampler) if train_sampler is not None else len(train_dataset),
         "val_samples": len(val_dataset),

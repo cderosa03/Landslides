@@ -53,7 +53,8 @@ def load_model(checkpoint_path):
         raise ValueError("Checkpoint must be a complete best_model.pth produced by train.py")
     config = checkpoint["config"]
     model = ChangeDetectionSwinUNet(
-        img_size=config["patch_size"], model_size=config["model_size"], pretrained=False
+        img_size=config["patch_size"], model_size=config["model_size"], pretrained=False,
+        use_s2=config.get("use_s2", True),
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
