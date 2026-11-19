@@ -20,3 +20,14 @@ dataset/cache/
 DELETE/matchati/
 DELETE/matched/
 DELETE/matchy/
+
+# dati e output generati
+s2_combined_candidate/
+s2_patches_candidate/
+s2_test_input/
+resume_input/
+patches_s2full/
+run_logs/
+s2_*.csv
+test_resume.csv
+diagnostics/

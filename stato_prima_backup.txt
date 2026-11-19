@@ -1,0 +1,6 @@
+Tue Oct 27 19:43:58 UTC 2026
+STATO PRIMA DEL BACKUP
+75G	s2_combined_candidate
+26G	s2_patches_candidate
+Comando per riprendere:
+python s2_builder/make_patches.py --patches-root Landslides/PlanetScope/patches --s2-combined-root s2_combined_candidate --events Lombok2018 Philippines2019 --limit-patches 0 --resume --apply --min-valid-coverage 0.95 --report s2_patches_resume.csv
